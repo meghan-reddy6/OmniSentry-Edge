@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Large model binaries
+models/
+
+# Local diagnostic logs
+*.log
+sensing_head.log
+
+# Testing caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor / OS specifics
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
