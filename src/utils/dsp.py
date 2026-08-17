@@ -16,19 +16,23 @@ def calculate_rms_db(signal: np.ndarray) -> float:
         signal: 1D numpy array representing the audio samples.
         
     Returns:
-        float: RMS value in dB relative to full scale (dBFS), ranging up to 0 dB.
+        float: RMS value in dB relative to full scale (dBFS), ranging from -90.0 to 0.0 dB.
     """
     if len(signal) == 0:
-        return -100.0
+        return -90.0
     
-    # Compute Root Mean Square (RMS)
-    rms = np.sqrt(np.mean(np.square(signal)))
-    if rms <= 1e-10:
-        return -100.0
+    # Safely cast and normalize if it is integer PCM
+    if np.issubdtype(signal.dtype, np.integer):
+        audio_float = signal.astype(np.float32) / 32768.0
+    else:
+        audio_float = signal.astype(np.float32)
     
-    # Convert to dB relative to full scale (assuming signal is normalized between -1.0 and 1.0)
-    db = 20.0 * np.log10(rms)
-    return float(db)
+    # Compute Root Mean Square (RMS) safely
+    rms = np.sqrt(np.mean(audio_float ** 2) + 1e-12)
+    
+    # Compute Decibels and clamp output
+    db = float(np.clip(20.0 * np.log10(rms), -90.0, 0.0))
+    return db
 
 def estimate_doa_gcc_phat(
     chan1: np.ndarray, 

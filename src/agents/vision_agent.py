@@ -17,7 +17,7 @@ from src.common.config import SystemConfig
 from src.common.messages import (
     Event, VerifyFaceCommand, TargetVerifiedEvent, TargetNotFoundEvent,
     TrackingErrorEvent, TrackCommand, StateChangedEvent, SystemState,
-    ServoPositionEvent
+    ServoPositionEvent, VoiceCommandEvent, AudioLevelEvent
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,49 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"Not Found")
 
+def compute_nms(boxes, scores, overlap_thresh=0.3):
+    """
+    Applies Non-Maximum Suppression (NMS) on bounding boxes.
+    boxes: list or array of [x, y, w, h]
+    scores: list or array of confidence scores
+    """
+    if len(boxes) == 0:
+        return []
+    
+    boxes = np.array(boxes, dtype=np.float32)
+    scores = np.array(scores, dtype=np.float32)
+    
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 0] + boxes[:, 2]
+    y2 = boxes[:, 1] + boxes[:, 3]
+    
+    areas = (x2 - x1) * (y2 - y1)
+    idxs = np.argsort(scores)[::-1]
+    
+    pick = []
+    while len(idxs) > 0:
+        last = len(idxs) - 1
+        i = idxs[0]
+        pick.append(i)
+        
+        xx1 = np.maximum(x1[i], x1[idxs[1:]])
+        yy1 = np.maximum(y1[i], y1[idxs[1:]])
+        xx2 = np.minimum(x2[i], x2[idxs[1:]])
+        yy2 = np.minimum(y2[i], y2[idxs[1:]])
+        
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        
+        intersection = w * h
+        union = areas[i] + areas[idxs[1:]] - intersection
+        union = np.maximum(union, 1e-6)
+        iou = intersection / union
+        
+        idxs = idxs[np.where(iou <= overlap_thresh)[0] + 1]
+        
+    return pick
+
 class VisionVLMAgent(BaseAgent):
     """
     Executes NPU-accelerated face verification and VLM tracking loops.
@@ -103,12 +146,20 @@ class VisionVLMAgent(BaseAgent):
         self._last_target_box = None     # (x, y, w, h)
         self.current_pan = 0.0
         self.current_tilt = 0.0
+        self._current_detected_faces = []
+        self.lost_target_timestamp = None
+        self.last_voice_command = None
+        self.last_audio_rms = -100.0
+        self.calibrated_noise_floor = -55.0
+        self._active_routing_engine = "None"
         
         # Subscribe to Orchestrator state changes and commands
         self.subscribe(StateChangedEvent)
         self.subscribe(VerifyFaceCommand)
         self.subscribe(TrackCommand)
         self.subscribe(ServoPositionEvent)
+        self.subscribe(VoiceCommandEvent)
+        self.subscribe(AudioLevelEvent)
 
     async def setup(self):
         logger.info("Setting up VisionVLMAgent...")
@@ -165,6 +216,11 @@ class VisionVLMAgent(BaseAgent):
                 self._last_error = None
                 self.reground_attempts = 0
                 self.tracking_frame_count = 0
+                self.lost_target_timestamp = None
+                
+            # Clear detected faces if not in verification state
+            if self.current_state != SystemState.VISUAL_VERIFYING:
+                self._current_detected_faces = []
                 
         elif isinstance(event, VerifyFaceCommand):
             logger.info("Received command to verify face.")
@@ -176,10 +232,18 @@ class VisionVLMAgent(BaseAgent):
             self.tracker = None
             self._last_target_box = None
             self._last_error = None
+            self._active_routing_engine = "None"
             
         elif isinstance(event, ServoPositionEvent):
             self.current_pan = event.pan
             self.current_tilt = event.tilt
+            
+        elif isinstance(event, VoiceCommandEvent):
+            self.last_voice_command = event.transcript
+            
+        elif isinstance(event, AudioLevelEvent):
+            self.last_audio_rms = event.rms_db
+            self.calibrated_noise_floor = event.noise_floor
 
     def _start_web_server(self):
         """Starts the background diagnostics MJPEG stream HTTP server."""
@@ -358,17 +422,28 @@ class VisionVLMAgent(BaseAgent):
         cv2.line(frame, (cx, cy - 15), (cx, cy + 15), (0, 0, 255), 2)
         
         # 2. Target Bounding Box
-        if target_box is not None:
-            tx, ty, tw, th = [int(v) for v in target_box]
-            if state == SystemState.VISUAL_VERIFYING:
-                color = (0, 255, 0) # Green for verified face
-                label = "Verified Face"
-            else:
-                color = (255, 128, 0) # Orange/Blue for VLM target object
+        if state == SystemState.VISUAL_VERIFYING:
+            detected_faces = getattr(self, "_current_detected_faces", [])
+            num_faces = len(detected_faces)
+            if num_faces > 1:
+                # Multiple faces: Draw RED boxes for all
+                for face in detected_faces:
+                    tx, ty, tw, th = [int(v) for v in face[0:4]]
+                    cv2.rectangle(frame, (tx, ty), (tx + tw, ty + th), (0, 0, 255), 2)
+                    cv2.putText(frame, "AMBIGUOUS (IGNORED)", (tx, ty - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+            elif num_faces == 1:
+                # Single face: Draw GREEN box
+                face = detected_faces[0]
+                tx, ty, tw, th = [int(v) for v in face[0:4]]
+                cv2.rectangle(frame, (tx, ty), (tx + tw, ty + th), (0, 255, 0), 2)
+                cv2.putText(frame, "LOCKED: SINGLE TARGET", (tx, ty - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        else:
+            if target_box is not None:
+                tx, ty, tw, th = [int(v) for v in target_box]
+                color = (255, 128, 0)
                 label = f"Target: {self.tracking_prompt}" if self.tracking_prompt else "Object Target"
-                
-            cv2.rectangle(frame, (tx, ty), (tx + tw, ty + th), color, 2)
-            cv2.putText(frame, label, (tx, ty - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                cv2.rectangle(frame, (tx, ty), (tx + tw, ty + th), color, 2)
+                cv2.putText(frame, label, (tx, ty - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
             
         # 3. Spatial Error Vector Line (Yellow from center to target center)
         if error_coords is not None:
@@ -379,12 +454,30 @@ class VisionVLMAgent(BaseAgent):
             cv2.circle(frame, (target_cx, target_cy), 5, (0, 255, 255), -1)
             
         # 4. Diagnostic Status Overlay text block
+        engine_str = f" [Engine: {self._active_routing_engine}]" if self._active_routing_engine != "None" else ""
         hud_lines = [
-            f"STATE : {state.value}",
+            f"STATE : {state.value}{engine_str}",
             f"FPS   : {fps:.1f}",
             f"PAN   : {self.current_pan:+.1f} deg",
             f"TILT  : {self.current_tilt:+.1f} deg",
         ]
+        
+        # Add real-time audio levels to telemetry
+        hud_lines.append(f"AUDIO : {self.last_audio_rms:+.1f} dB (Floor: {self.calibrated_noise_floor:+.1f} dB)")
+        
+        if getattr(self, "last_voice_command", None) is not None:
+            hud_lines.append(f"VOICE : \"{self.last_voice_command}\"")
+        
+        if state == SystemState.VISUAL_VERIFYING:
+            detected_faces = getattr(self, "_current_detected_faces", [])
+            num_faces = len(detected_faces)
+            if num_faces > 1:
+                hud_lines.append(f"ALERT : AMBIGUOUS: {num_faces} PERSONS")
+            elif num_faces == 1:
+                hud_lines.append("LOCK  : SINGLE TARGET CONFIRMED")
+            else:
+                hud_lines.append("SEARCH: NO PERSON DETECTED")
+                
         if error_coords is not None:
             dx, dy = error_coords
             hud_lines.append(f"ERROR : dx={dx:+.2f}, dy={dy:+.2f}")
@@ -397,14 +490,31 @@ class VisionVLMAgent(BaseAgent):
         else:
             hud_lines.append("TARGET: None")
 
+        # Draw hardware status capsule at the top-left
+        if self.config.simulation_mode:
+            cv2.rectangle(frame, (10, 10), (280, 32), (0, 128, 255), -1) # Filled orange
+            cv2.putText(frame, "[DEV MODE: SIMULATION MOCK]", (18, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        else:
+            cv2.rectangle(frame, (10, 10), (280, 32), (0, 180, 0), -1) # Filled green
+            cv2.putText(frame, "[HARDWARE: CAM #0 | MIC LIVE]", (18, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
         # Draw semi-transparent dark backdrop box to keep text legible in all lighting
-        box_h = 20 * len(hud_lines) + 12
-        cv2.rectangle(frame, (10, 10), (250, 10 + box_h), (0, 0, 0), -1)
+        box_y = 40
+        is_recovering = getattr(self, "lost_target_timestamp", None) is not None
+        num_lines = len(hud_lines) + (1 if is_recovering else 0)
+        box_h = 20 * num_lines + 12
+        cv2.rectangle(frame, (10, box_y), (280, box_y + box_h), (0, 0, 0), -1)
         
-        y_offset = 26
+        y_offset = box_y + 16
         for line in hud_lines:
-            cv2.putText(frame, line, (18, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, line, (18, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
             y_offset += 20
+            
+        if is_recovering:
+            elapsed = time.time() - self.lost_target_timestamp
+            remaining = max(0.0, 1.5 - elapsed)
+            warning_text = f"RECOVERING TARGET... ({remaining:.1f}s)"
+            cv2.putText(frame, warning_text, (18, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
 
     def _preprocess_image_for_model(self, frame, size=(640, 640)):
         """Helper to resize, transpose, and batch frames into float32 tensors [1, 3, H, W] for ONNX Runtime."""
@@ -421,6 +531,8 @@ class VisionVLMAgent(BaseAgent):
         if self.config.simulation_mode:
             # Mock mode: runs mock inference session
             # Mock session expects shape [1, N, 15] returned by run()
+            self._face_session.current_pan = self.current_pan
+            self._face_session.current_tilt = self.current_tilt
             outputs = self._face_session.run(None, None)
             if outputs and len(outputs[0]) > 0:
                 return outputs[0][0] # Returns array of shape [N, 15]
@@ -449,7 +561,10 @@ class VisionVLMAgent(BaseAgent):
                 if retval > 0 and faces is not None:
                     return faces
             except Exception as e:
-                logger.error(f"Error in face detection: {e}", exc_info=True)
+                now = time.time()
+                if now - getattr(self, "_last_face_error_time", 0.0) > 5.0:
+                    logger.error(f"Error in face detection: {e}. If you are in hardware mode, please run the model downloader WITHOUT the '--dummy' flag to download real model weights.")
+                    self._last_face_error_time = now
             return None
 
     def is_valid_bbox(self, bbox, min_size=30) -> bool:
@@ -459,22 +574,35 @@ class VisionVLMAgent(BaseAgent):
         x, y, w, h = bbox
         return w >= min_size and h >= min_size
 
-    def _run_grounding(self, frame, width, height) -> tuple[int, int, int, int] | None:
+    def _run_grounding(self, frame, width, height, threshold=0.30) -> tuple[int, int, int, int] | None:
         """Runs the face detector or YOLO-World VLM to locate the target prompt."""
         import os
-        if self.tracking_prompt and self.tracking_prompt.lower() in ("face", "humanface", "person", "head"):
+        prompt = self.tracking_prompt.lower().strip() if self.tracking_prompt else ""
+        
+        FACE_KEYWORDS = {"face", "head", "human face", "my face", "person face", "eyes"}
+        PERSON_KEYWORDS = {"person", "human", "man", "woman", "guy", "girl", "body", "people"}
+        
+        is_face = (prompt in FACE_KEYWORDS) or (self._active_routing_engine == "YuNet Face")
+        is_person = (prompt in PERSON_KEYWORDS) or (self._active_routing_engine == "YOLO-World" and prompt in PERSON_KEYWORDS)
+        
+        if is_face:
+            self._active_routing_engine = "YuNet Face"
+            logger.info(f"[VisionAgent]: Routing prompt '{self.tracking_prompt}' directly to high-precision YuNet Face Detector.")
             faces = self._detect_faces(frame, width, height)
             if faces is not None and len(faces) > 0:
                 x_min, y_min, w, h = faces[0][0:4]
                 return (int(x_min), int(y_min), int(w), int(h))
             return None
         else:
+            self._active_routing_engine = "YOLO-World"
             # YOLO-World VLM object grounding
-            logger.debug(f"Executing YOLO-World open-vocabulary grounding for: '{self.tracking_prompt}'")
+            logger.info(f"[VisionAgent]: Executing YOLO-World open-vocabulary grounding for: '{self.tracking_prompt}'")
+            
+            grounding_prompt = "person" if is_person else prompt
+            
             blob = self._preprocess_image_for_model(frame, (640, 640))
             blob = blob / 255.0
             
-            prompt = self.tracking_prompt.lower().strip() if self.tracking_prompt else ""
             embeddings_path = "models/coco_embeddings.npy"
             txt_feat = np.zeros((1, 512), dtype=np.float32)
             
@@ -483,7 +611,7 @@ class VisionVLMAgent(BaseAgent):
                     embed_dict = np.load(embeddings_path, allow_pickle=True).item()
                     matched_cls = None
                     for cls in embed_dict.keys():
-                        if cls in prompt or prompt in cls:
+                        if cls == grounding_prompt or cls in grounding_prompt or grounding_prompt in cls:
                             matched_cls = cls
                             break
                     
@@ -491,7 +619,7 @@ class VisionVLMAgent(BaseAgent):
                         logger.debug(f"Found pre-computed CLIP embedding for matched class: '{matched_cls}'")
                         txt_feat = embed_dict[matched_cls].reshape(1, 512)
                     else:
-                        logger.debug(f"No match for prompt '{prompt}' in COCO classes. Using default ('cup').")
+                        logger.debug(f"No match for prompt '{grounding_prompt}' in COCO classes. Using default ('cup').")
                         if "cup" in embed_dict:
                             txt_feat = embed_dict["cup"].reshape(1, 512)
                 except Exception as e:
@@ -505,6 +633,9 @@ class VisionVLMAgent(BaseAgent):
                 "images": blob,
                 "txt_feats": txt_feats
             }
+            if self.config.simulation_mode:
+                self._vlm_session.current_pan = self.current_pan
+                self._vlm_session.current_tilt = self.current_tilt
             
             try:
                 outputs = self._vlm_session.run(None, inputs)
@@ -535,7 +666,7 @@ class VisionVLMAgent(BaseAgent):
                         max_idx = np.argmax(scores)
                         max_score = scores[max_idx]
                         
-                        if max_score >= 0.35: # Confidence threshold
+                        if max_score >= threshold: # Confidence threshold
                             x_center, y_center, w, h = predictions[max_idx, 0:4]
                             
                             scale_x = width / 640.0
@@ -547,7 +678,7 @@ class VisionVLMAgent(BaseAgent):
                             box_h = h * scale_y
                             
                             bbox = (int(x_min), int(y_min), int(box_w), int(box_h))
-                            logger.debug(f"YOLO-World localized target '{prompt}' with score: {max_score:.3f} -> bbox: {bbox}")
+                            logger.debug(f"YOLO-World localized target '{grounding_prompt}' with score: {max_score:.3f} -> bbox: {bbox}")
             
             if bbox is None:
                 if self.config.simulation_mode:
@@ -561,61 +692,88 @@ class VisionVLMAgent(BaseAgent):
 
     def _process_face_verification(self, frame, width, height, threshold):
         """Runs face detection for verifying sound seekers."""
-        faces = self._detect_faces(frame, width, height)
+        raw_faces = self._detect_faces(frame, width, height)
         
-        if faces is not None and len(faces) > 0:
-            face = faces[0]  # Take primary face
-            score = face[14]
-            if score >= threshold:
-                x_min, y_min, w, h = face[0:4]
-                self._last_target_box = (x_min, y_min, w, h)
-                
-                center_x = x_min + w / 2.0
-                center_y = y_min + h / 2.0
-                
-                norm_x = (center_x - width / 2.0) / (width / 2.0)
-                norm_y = (center_y - height / 2.0) / (height / 2.0)
-                self._last_error = (norm_x, norm_y)
-                
-                logger.info(f"Face verified! Center: ({center_x:.1f}, {center_y:.1f}) -> Norm: ({norm_x:+.2f}, {norm_y:+.2f})")
-                event = TargetVerifiedEvent(center_x=norm_x, center_y=norm_y)
-                asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
-                return
+        # 1. Filter by confidence threshold
+        valid_faces = []
+        if raw_faces is not None and len(raw_faces) > 0:
+            for face in raw_faces:
+                score = face[14]
+                if score >= threshold:
+                    valid_faces.append(face)
+        
+        # 2. Apply NMS to eliminate overlapping duplicate boxes
+        if len(valid_faces) > 1:
+            boxes = [face[0:4] for face in valid_faces]
+            scores = [face[14] for face in valid_faces]
+            pick = compute_nms(boxes, scores, overlap_thresh=0.3)
+            filtered_faces = [valid_faces[i] for i in pick]
+        else:
+            filtered_faces = valid_faces
 
-        # Verification failed or nothing found
-        self._last_target_box = None
-        self._last_error = None
+        self._current_detected_faces = filtered_faces
+
+        # Case 1: Multiple Faces Detected (len(filtered_faces) > 1)
+        if len(filtered_faces) > 1:
+            logger.warning(f"WARNING: Multiple persons detected ({len(filtered_faces)}). Aborting target lock per single-person rule.")
+            self._last_target_box = None
+            self._last_error = None
+            event = TargetNotFoundEvent(reason="multiple_persons")
+            asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
+            return
+
+        # Case 2: Exactly One Face Detected (len(filtered_faces) == 1)
+        elif len(filtered_faces) == 1:
+            face = filtered_faces[0]
+            x_min, y_min, w, h = face[0:4]
+            self._last_target_box = (x_min, y_min, w, h)
+            
+            center_x = x_min + w / 2.0
+            center_y = y_min + h / 2.0
+            
+            norm_x = (center_x - width / 2.0) / (width / 2.0)
+            norm_y = (center_y - height / 2.0) / (height / 2.0)
+            self._last_error = (norm_x, norm_y)
+            
+            logger.info(f"INFO: Single person confirmed at {self._last_target_box}. Engaging tracking.")
+            event = TargetVerifiedEvent(center_x=norm_x, center_y=norm_y)
+            asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
+            return
+
+        # Case 3: Zero Faces Detected (len(filtered_faces) == 0)
+        else:
+            self._last_target_box = None
+            self._last_error = None
 
     def _process_object_tracking(self, frame, width, height):
         """Runs VLM grounding and local tracking with recovery, filtering, and re-anchoring."""
         
         # Stage 1: If tracking is active, update the tracker and handle re-anchoring
-        if self.tracking_active and self.tracker is not None:
+        success = False
+        bbox = None
+        
+        if self.tracking_active and self.tracker is not None and self.lost_target_timestamp is None:
             self.tracking_frame_count += 1
             
             # Periodic Re-Anchoring (every 30 frames) to prevent drift
-            reanchored_successfully = True
             if self.tracking_frame_count % 30 == 0:
                 logger.debug(f"Frame {self.tracking_frame_count}: Triggering periodic VLM re-anchoring...")
-                refreshed_bbox = self._run_grounding(frame, width, height)
+                # Re-anchoring uses threshold=0.25
+                refreshed_bbox = self._run_grounding(frame, width, height, threshold=0.25)
                 if self.is_valid_bbox(refreshed_bbox, min_size=30):
                     logger.debug(f"Periodic re-anchoring succeeded. Re-init tracker to: {refreshed_bbox}")
                     self.tracker = self._create_opencv_tracker()
                     self.tracker.init(frame, refreshed_bbox)
                     self._last_target_box = refreshed_bbox
-                    self.reground_attempts = 0
                 else:
-                    logger.warning(f"Periodic VLM re-anchoring failed to locate target '{self.tracking_prompt}'. Lost lock.")
-                    reanchored_successfully = False
+                    logger.debug("Periodic VLM re-anchoring failed/returned invalid box. Continuing with current track.")
 
             # Update high-speed local tracker
-            success = False
-            if reanchored_successfully:
-                success, bbox = self.tracker.update(frame)
+            success, bbox = self.tracker.update(frame)
             if success:
                 # Double-check bounding box sanity
                 if self.is_valid_bbox(bbox, min_size=30):
-                    self.reground_attempts = 0  # Reset recovery counter on successful track
+                    self.lost_target_timestamp = None  # Reset recovery grace timer on successful track
                     x, y, w, h = [int(v) for v in bbox]
                     self._last_target_box = (x, y, w, h)
                     
@@ -633,57 +791,79 @@ class VisionVLMAgent(BaseAgent):
                 else:
                     logger.debug(f"Tracker returned unsafe/too small bounding box: {bbox}. Treating as lock lost.")
                     success = False
+        
+        # Stage 2: Target Recovery / Initial Grounding Loop
+        if not success:
+            if self.lost_target_timestamp is None:
+                self.lost_target_timestamp = time.time()
+                logger.warning("Visual tracker lost target. Entering recovery grace period.")
+                
+            elapsed = time.time() - self.lost_target_timestamp
             
-            # Handle lock loss
-            if not success:
+            if elapsed < 1.5:
+                # Use threshold=0.30 if we have never locked onto a target, otherwise 0.25
+                thresh = 0.30 if self.tracker is None else 0.25
+                bbox = self._run_grounding(frame, width, height, threshold=thresh)
+                
+                if self.is_valid_bbox(bbox, min_size=30):
+                    logger.info(f"Target successfully located/recovered via VLM. BBox: {bbox}")
+                    self.tracker = self._create_opencv_tracker()
+                    self.tracker.init(frame, bbox)
+                    self.tracking_active = True
+                    self._last_target_box = bbox
+                    self.lost_target_timestamp = None
+                    self.tracking_frame_count = 0
+                    
+                    # Calculate center error delta
+                    x, y, w, h = bbox
+                    center_x = x + w / 2.0
+                    center_y = y + h / 2.0
+                    dx = (center_x - width / 2.0) / (width / 2.0)
+                    dy = (center_y - height / 2.0) / (height / 2.0)
+                    self._last_error = (dx, dy)
+                    
+                    event = TrackingErrorEvent(dx=dx, dy=dy)
+                    asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
+                else:
+                    # Still lost, keep warning HUD rendering
+                    self._last_target_box = None
+                    self._last_error = None
+            else:
+                logger.warning("Target lost for > 1.5s. Aborting tracking.")
                 self.tracking_active = False
                 self.tracker = None
                 self._last_target_box = None
                 self._last_error = None
-        
-        # Stage 2: Target Recovery / Initial Grounding Loop
-        self.reground_attempts += 1
-        
-        if self.reground_attempts <= 3:
-            logger.debug(f"Attempting VLM grounding/recovery (attempt {self.reground_attempts}/3)...")
-            bbox = self._run_grounding(frame, width, height)
-            
-            if self.is_valid_bbox(bbox, min_size=30):
-                self.tracker = self._create_opencv_tracker()
-                self.tracker.init(frame, bbox)
-                self.tracking_active = True
-                self._last_target_box = bbox
-                self.reground_attempts = 0
-                self.tracking_frame_count = 0
-                logger.info(f"Target successfully located and locked. BBox: {bbox}")
-            else:
-                logger.debug(f"Grounding attempt {self.reground_attempts}/3 failed to find a valid target.")
-                # Leave self.tracking_active = False to try again on next frame
-        
-        if self.reground_attempts > 3:
-            logger.warning("VLM grounding failed 3 consecutive times. Aborting track.")
-            self.tracking_active = False
-            self.tracker = None
-            self._last_target_box = None
-            self._last_error = None
-            self.reground_attempts = 0
-            self.tracking_frame_count = 0
-            
-            event = TargetNotFoundEvent()
-            asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
+                self.lost_target_timestamp = None
+                
+                event = TargetNotFoundEvent(reason="lost")
+                asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
 
     def _create_opencv_tracker(self):
-        """Creates cv2 CSRT tracker, falling back gracefully if not compiled."""
+        """Creates configured OpenCV tracker, falling back gracefully to KCF if not compiled."""
+        tracker_type = self.config.vision.get("tracker_type", "KCF").upper()
         try:
-            return cv2.TrackerCSRT_create()
+            if tracker_type == "KCF":
+                try:
+                    return cv2.TrackerKCF_create()
+                except AttributeError:
+                    return cv2.legacy.TrackerKCF_create()
+            elif tracker_type == "CSRT":
+                try:
+                    return cv2.TrackerCSRT_create()
+                except AttributeError:
+                    return cv2.legacy.TrackerCSRT_create()
+            else:
+                # Default to KCF for speed
+                try:
+                    return cv2.TrackerKCF_create()
+                except AttributeError:
+                    return cv2.legacy.TrackerKCF_create()
         except AttributeError:
-            try:
-                return cv2.legacy.TrackerCSRT_create()
-            except AttributeError:
-                if not getattr(self, "_tracker_warning_shown", False):
-                    logger.warning("OpenCV CSRT tracker not compiled in cv2. Using SimpleCentroidTracker fallback.")
-                    self._tracker_warning_shown = True
-                return SimpleCentroidTracker()
+            if not getattr(self, "_tracker_warning_shown", False):
+                logger.warning(f"OpenCV {tracker_type} tracker not compiled in cv2. Using SimpleCentroidTracker fallback.")
+                self._tracker_warning_shown = True
+            return SimpleCentroidTracker()
 
 class SimpleCentroidTracker:
     """Fallback simulated centroid tracker when CSRT is unavailable."""

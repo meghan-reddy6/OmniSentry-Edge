@@ -12,6 +12,20 @@ audio:
   vad_threshold_db: -45.0  # Decibel energy gate threshold
   mic_distance: 0.08       # Physical distance between mics in meters (8 cm)
   speed_of_sound: 343.0    # Speed of sound in m/s
+  enable_voice_commands: true
+  asr_backend: "whisper_tiny_onnx"  # Options: "whisper_tiny_onnx" or "keyword_matcher"
+  asr_model_path: "models/whisper_tiny_en_int8.onnx"
+  wake_phrases: ["track", "find", "locate", "home", "reset"]
+  speech_silence_timeout: 0.7  # Seconds of silence after speech before triggering transcription
+  enable_wake_word: true
+  wake_word: "sentry"
+  wake_timeout_seconds: 5.0 # Window to speak command after wake word
+  feedback_tone_enabled: true
+  feedback_tone_freq: 650 # Hz
+  feedback_tone_duration: 0.15 # Seconds
+  auto_calibrate_vad: true
+  vad_margin_db: 9.0
+  fallback_vad_threshold_db: -45.0
 
 # PCA9685 I2C Servo control settings
 servo:
@@ -28,13 +42,13 @@ servo:
   
   # Dual-axis PID controller tracking coefficients
   pan_pid:
-    kp: 0.08
-    ki: 0.01
-    kd: 0.002
+    kp: 15.0
+    ki: 0.1
+    kd: 0.5
   tilt_pid:
-    kp: 0.08
-    ki: 0.01
-    kd: 0.002
+    kp: 15.0
+    ki: 0.1
+    kd: 0.5
     
   # Home/neutral position
   home_pan: 0.0
@@ -42,6 +56,7 @@ servo:
 
 # OpenCV and NPU-accelerated Vision / VLM parameters
 vision:
+  tracker_type: "KCF"     # Options: "KCF" (100+ FPS) or "CSRT" (15 FPS, very slow)
   camera_index: 0
   frame_width: 640
   frame_height: 480

@@ -16,7 +16,7 @@ if project_root not in sys.path:
 
 from src.common.config import SystemConfig
 from src.common.bus import EventBus
-from src.common.messages import TrackCommand, MoveHomeCommand
+from src.common.messages import TrackCommand, MoveHomeCommand, SimulateSpeechCommand
 from src.agents.orchestrator import OrchestratorAgent
 from src.agents.audio_agent import AudioSensingAgent
 from src.agents.vision_agent import VisionVLMAgent
@@ -40,6 +40,7 @@ async def cli_input_loop(bus: EventBus, shutdown_event: asyncio.Event):
     print("Available Commands:")
     print("  track <prompt>  - Initialize VLM tracking loop (e.g. 'track cup')")
     print("  home            - Command the Pan/Tilt servos back to home (0, 0)")
+    print("  say <phrase>    - Inject a simulated voice command transcription")
     print("  exit            - Stop all agents and terminate the program")
     print("="*60 + "\n")
 
@@ -67,8 +68,15 @@ async def cli_input_loop(bus: EventBus, shutdown_event: asyncio.Event):
             elif cmd == "home":
                 logger.info("CLI: Command returning servos to center position.")
                 await bus.publish(MoveHomeCommand())
+            elif cmd == "say":
+                if len(parts) < 2 or not parts[1].strip():
+                    print("Error: Missing text for simulated speech (e.g. 'say sentry')")
+                    continue
+                phrase = parts[1].strip()
+                logger.info(f"CLI: Injecting simulated speech transcript: '{phrase}'")
+                await bus.publish(SimulateSpeechCommand(text=phrase))
             else:
-                print(f"Unknown command: '{cmd}'. Commands: 'track <prompt>', 'home', 'exit'")
+                print(f"Unknown command: '{cmd}'. Commands: 'track <prompt>', 'home', 'say <phrase>', 'exit'")
         except asyncio.CancelledError:
             break
         except Exception as e:

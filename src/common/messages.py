@@ -48,7 +48,7 @@ class TargetVerifiedEvent(Event):
 @dataclass
 class TargetNotFoundEvent(Event):
     """Emitted by VisionVLMAgent if verification fails or target is lost."""
-    pass
+    reason: str = "lost"
 
 @dataclass
 class TrackingErrorEvent(Event):
@@ -77,3 +77,19 @@ class ServoPositionEvent(Event):
     """Emitted by ServoActuatorAgent when servo angles are updated."""
     pan: float
     tilt: float
+
+@dataclass
+class VoiceCommandEvent(Event):
+    """Emitted by AudioSensingAgent when a voice command is recognized."""
+    transcript: str
+
+@dataclass
+class SimulateSpeechCommand(Event):
+    """Simulates voice input by injecting a transcription directly into the audio agent."""
+    text: str
+
+@dataclass
+class AudioLevelEvent(Event):
+    """Emitted by AudioSensingAgent to broadcast real-time volume levels."""
+    rms_db: float
+    noise_floor: float

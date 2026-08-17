@@ -117,54 +117,100 @@ class MockInferenceSession:
         self.input_names = ["input", "image", "prompt"]
         self.output_names = ["output"]
         
-        # Simulation parameters to return valid detections
-        self.simulated_face_x = 350.0  # Slightly offset from center (320, 240)
-        self.simulated_face_y = 220.0
-        self.simulated_face_size = 60.0
+        # Servo angles updated dynamically by VisionAgent
+        self.current_pan = 0.0
+        self.current_tilt = 0.0
         
-        self.simulated_object_x = 400.0
-        self.simulated_object_y = 300.0
+        # Session start baselines
+        self.start_pan = None
+        self.start_tilt = None
+        
+        # Camera FOV angles
+        self.fov_x = 60.0
+        self.fov_y = 45.0
+        
+        # Simulation parameters to return valid detections
+        self.simulated_face_size = 60.0
         self.simulated_object_w = 80.0
         self.simulated_object_h = 80.0
         
         # Flag to toggle detection presence
         self.face_present = True
         self.object_present = True
+        self.face_count = 1
 
     def run(self, output_names=None, input_feed=None):
         """Simulates bounding box outputs based on feed types."""
-        # Check if Face Detection input (YuNet)
+        # Initialize start pan/tilt base lines on first frame
+        if self.start_pan is None:
+            self.start_pan = self.current_pan
+        if self.start_tilt is None:
+            self.start_tilt = self.current_tilt
+            
+        # Target is placed at +5.0 degrees pan and +2.0 degrees tilt from start
+        target_offset_pan = 5.0
+        target_offset_tilt = 2.0
+        
+        # Relative angle of target to camera frame
+        rel_pan = target_offset_pan - (self.current_pan - self.start_pan)
+        rel_tilt = target_offset_tilt - (self.current_tilt - self.start_tilt)
+        
+        # If target is outside the FOV, consider it not present
+        in_fov = (abs(rel_pan) <= self.fov_x / 2.0) and (abs(rel_tilt) <= self.fov_y / 2.0)
+        
+        # Map relative angles to pixel coordinates in 640x480 frame
+        x_offset = (rel_pan / (self.fov_x / 2.0)) * 320.0
+        y_offset = (rel_tilt / (self.fov_y / 2.0)) * 240.0
+        
+        simulated_x = 320.0 + x_offset
+        simulated_y = 240.0 - y_offset
+        
         # Face box outputs format: [ [ [x_min, y_min, w, h, ..., score] ] ] (1, N, 15)
         if "face" in self.model_path.lower():
-            if not self.face_present:
+            if not self.face_present or self.face_count == 0 or not in_fov:
+                # Reset start pan/tilt when session ends/face is lost
+                self.start_pan = None
+                self.start_tilt = None
                 return [np.zeros((1, 0, 15), dtype=np.float32)]
             
             w = self.simulated_face_size
             h = self.simulated_face_size
-            x_min = self.simulated_face_x - w / 2
-            y_min = self.simulated_face_y - h / 2
-            score = 0.95
             
             # YuNet output layout: [x_min, y_min, width, height, landmarks..., score]
-            detection = np.zeros((1, 1, 15), dtype=np.float32)
-            detection[0, 0, 0] = x_min
-            detection[0, 0, 1] = y_min
-            detection[0, 0, 2] = w
-            detection[0, 0, 3] = h
-            detection[0, 0, 14] = score
+            detection = np.zeros((1, self.face_count, 15), dtype=np.float32)
+            for i in range(self.face_count):
+                x_min = (simulated_x + i * 80.0) - w / 2
+                y_min = simulated_y - h / 2
+                score = 0.95
+                
+                detection[0, i, 0] = x_min
+                detection[0, i, 1] = y_min
+                detection[0, i, 2] = w
+                detection[0, i, 3] = h
+                detection[0, i, 14] = score
             return [detection]
             
         # Check if YOLO-World VLM input
         # Object box format: [ [ [x_min, y_min, w, h, score] ] ] (1, N, 5)
         else:
-            if not self.object_present:
+            if not self.object_present or not in_fov:
+                # Reset start pan/tilt when session ends/object is lost
+                self.start_pan = None
+                self.start_tilt = None
                 return [np.zeros((1, 0, 5), dtype=np.float32)]
                 
             w = self.simulated_object_w
             h = self.simulated_object_h
-            x = self.simulated_object_x - w / 2
-            y = self.simulated_object_y - h / 2
+            x = simulated_x - w / 2
+            y = simulated_y - h / 2
             score = 0.85
             
             detection = np.array([[[x, y, w, h, score]]], dtype=np.float32)
             return [detection]
+
+class MockASREngine:
+    """Mocks Whisper ONNX model or speech-to-text decoder engine."""
+    mock_transcription = "track book"
+    
+    def transcribe(self, audio_data: np.ndarray) -> str:
+        return self.mock_transcription

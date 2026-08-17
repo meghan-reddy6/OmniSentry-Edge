@@ -30,6 +30,7 @@ class OrchestratorAgent(BaseAgent):
         self.subscribe(TargetVerifiedEvent)
         self.subscribe(TargetNotFoundEvent)
         self.subscribe(TrackCommand)
+        self.subscribe(MoveHomeCommand)
 
     async def setup(self):
         logger.info("Orchestrator agent initializing...")
@@ -45,7 +46,11 @@ class OrchestratorAgent(BaseAgent):
         # Check for preemption by user command (TrackCommand)
         if isinstance(event, TrackCommand):
             await self._transition_to(SystemState.VLM_TRACKING)
-            # The VisionAgent will handle initializing model tracking for the given prompt
+            return
+
+        if isinstance(event, MoveHomeCommand):
+            if self.state != SystemState.IDLE and self.state != SystemState.RESETTING:
+                await self._transition_to(SystemState.RESETTING)
             return
 
         if self.state == SystemState.IDLE:
@@ -77,7 +82,10 @@ class OrchestratorAgent(BaseAgent):
 
             elif isinstance(event, TargetNotFoundEvent):
                 self._cancel_timer()
-                logger.warning("Face verification failed. Resetting...")
+                if event.reason == "multiple_persons":
+                    logger.warning("Face verification failed: multiple persons detected. Resetting...")
+                else:
+                    logger.warning("Face verification failed. Resetting...")
                 await self._transition_to(SystemState.RESETTING)
                 await self.bus.publish(MoveHomeCommand())
 
@@ -115,6 +123,6 @@ class OrchestratorAgent(BaseAgent):
         try:
             await asyncio.sleep(timeout)
             logger.warning(f"Verification timer expired after {timeout}s.")
-            await self.bus.publish(TargetNotFoundEvent())
+            await self.bus.publish(TargetNotFoundEvent(reason="timeout"))
         except asyncio.CancelledError:
             pass

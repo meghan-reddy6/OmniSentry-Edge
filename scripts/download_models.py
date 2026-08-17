@@ -12,6 +12,7 @@ import subprocess
 # Model URLs
 YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 YOLO_WORLD_URL = "https://huggingface.co/Instemic/yolo-world-onnx/resolve/main/yolov8s-worldv2.onnx"
+WHISPER_URL = "https://huggingface.co/Xenova/whisper-tiny.en/resolve/main/onnx/encoder_model_quantized.onnx"
 
 def ensure_onnx_installed() -> bool:
     """Verifies if 'onnx' library is installed, otherwise dynamically installs it."""
@@ -119,6 +120,42 @@ def create_dummy_yolo_world(path: str):
     onnx.save(model, path)
     print("Mock YOLO-World open-vocabulary graph created successfully.")
 
+def create_dummy_whisper(path: str):
+    """Generates a valid, minimal dummy Whisper ASR model using ONNX helper utilities."""
+    import onnx
+    from onnx import helper, TensorProto
+
+    print(f"Compiling mock Whisper ASR graph: {path}...")
+    
+    # Inputs: 'input_features' (float32, [1, 80, 3000])
+    # Outputs: 'logits' (float32, [1, 10, 512])
+    input_info = helper.make_tensor_value_info("input_features", TensorProto.FLOAT, [1, 80, 3000])
+    output_info = helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, 10, 512])
+    
+    # Simple constant output values
+    vals = [0.0] * (1 * 10 * 512)
+    tensor_value = helper.make_tensor(
+        name="const_logits_value",
+        data_type=TensorProto.FLOAT,
+        dims=[1, 10, 512],
+        vals=vals
+    )
+    
+    node = helper.make_node("Constant", [], ["logits"], value=tensor_value)
+    
+    graph = helper.make_graph(
+        nodes=[node],
+        name="dummy_whisper_graph",
+        inputs=[input_info],
+        outputs=[output_info]
+    )
+    
+    model = helper.make_model(graph, producer_name="rubikpi_dummy_generator")
+    model.opset_import[0].version = 11
+    
+    onnx.save(model, path)
+    print("Mock Whisper ASR graph created successfully.")
+
 def progress_hook(count, block_size, total_size):
     """Simple callback to display download percentage progress."""
     if total_size > 0:
@@ -152,12 +189,14 @@ def main():
     
     face_path = "models/face_detection_yunet_2023mar.onnx"
     vlm_path = "models/yolo_world_s_int8.onnx"
+    whisper_path = "models/whisper_tiny_en_int8.onnx"
 
     if args.dummy:
         print("Force-generating dummy models as requested by --dummy...")
         if ensure_onnx_installed():
             create_dummy_yunet(face_path)
             create_dummy_yolo_world(vlm_path)
+            create_dummy_whisper(whisper_path)
         else:
             print("Aborted generating dummy models because 'onnx' library is unavailable.")
         return
@@ -174,7 +213,7 @@ def main():
                 create_dummy_yunet(face_path)
 
     # YOLO-World Grounding Model
-    print("\n--- [2/2] VLM Object Grounding Model: YOLO-World-S ---")
+    print("\n--- [2/3] VLM Object Grounding Model: YOLO-World-S ---")
     if os.path.exists(vlm_path):
         print(f"VLM grounding model already exists at: {vlm_path}")
     else:
@@ -183,6 +222,17 @@ def main():
             print("YOLO-World-S download failed. Falling back to dummy generation...")
             if ensure_onnx_installed():
                 create_dummy_yolo_world(vlm_path)
+                
+    # Whisper ASR Model
+    print("\n--- [3/3] Speech-to-Text Model: Whisper-Tiny-EN-INT8 ---")
+    if os.path.exists(whisper_path):
+        print(f"ASR model already exists at: {whisper_path}")
+    else:
+        success = download_file(WHISPER_URL, whisper_path)
+        if not success:
+            print("Whisper ASR download failed. Falling back to dummy generation...")
+            if ensure_onnx_installed():
+                create_dummy_whisper(whisper_path)
                 
     print("\nAll models configured. Ready to run the sensing head.")
 

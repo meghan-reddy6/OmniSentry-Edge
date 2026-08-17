@@ -11,7 +11,8 @@ from src.common.config import SystemConfig
 from src.common.messages import (
     SystemState, SoundLocalizedEvent, MoveToCommand, MotionDoneEvent,
     VerifyFaceCommand, TargetVerifiedEvent, TargetNotFoundEvent,
-    TrackingErrorEvent, TrackCommand, MoveHomeCommand, StateChangedEvent
+    TrackingErrorEvent, TrackCommand, MoveHomeCommand, StateChangedEvent,
+    SimulateSpeechCommand, VoiceCommandEvent, AudioLevelEvent
 )
 from src.agents.orchestrator import OrchestratorAgent
 from src.utils.dsp import calculate_rms_db, estimate_doa_gcc_phat
@@ -25,7 +26,7 @@ def test_calculate_rms_db():
     # Test silent signal (all zeros)
     silent = np.zeros(1024)
     db_silent = calculate_rms_db(silent)
-    assert db_silent == -100.0
+    assert db_silent == -90.0
 
     # Test full scale sine wave (amplitude 1.0)
     # RMS of sine wave = A / sqrt(2) ≈ 0.707
@@ -262,47 +263,382 @@ def test_vision_agent_bbox_filtering_and_recovery():
         
         vision_agent.tracker = MockTrackerFail()
         
-        # Execute processing: it should lose lock, increment reground_attempts to 1,
-        # run grounding (which succeeds in mock mode because face is present), and re-init tracker!
-        # Thus, tracking_active remains True, and reground_attempts resets to 0.
+        # Execute processing: tracker fails, triggers lost_target_timestamp,
+        # runs grounding (which succeeds in mock mode because face is present), and re-init tracker!
+        # Thus, tracking_active remains True, and lost_target_timestamp resets to None.
         vision_agent._process_object_tracking(frame, 640, 480)
         assert vision_agent.tracking_active is True
-        assert vision_agent.reground_attempts == 0
+        assert vision_agent.lost_target_timestamp is None
         
         # 3. Now simulate face NOT present in MockInferenceSession to force grounding failure
         vision_agent._face_session.face_present = False
         vision_agent.tracker = MockTrackerFail()
         
-        # Execute processing: tracker fails, it attempts grounding (fails since face_present=False),
-        # so reground_attempts becomes 1, tracking_active becomes False.
+        # Execute processing: tracker fails, sets lost_target_timestamp.
+        # Attempts grounding (fails since face_present=False).
+        # Elapsed time is < 1.5s, so tracking_active remains True.
         vision_agent._process_object_tracking(frame, 640, 480)
-        assert vision_agent.tracking_active is False
-        assert vision_agent.reground_attempts == 1
+        assert vision_agent.tracking_active is True
+        assert vision_agent.lost_target_timestamp is not None
         
-        # Next frame: tracking_active is False. It attempts grounding, fails.
-        # reground_attempts becomes 2.
+        # Next frame: fails again, elapsed < 1.5s, tracking_active remains True
         vision_agent._process_object_tracking(frame, 640, 480)
-        assert vision_agent.tracking_active is False
-        assert vision_agent.reground_attempts == 2
-        
-        # Next frame: fails again.
-        # reground_attempts becomes 3.
-        vision_agent._process_object_tracking(frame, 640, 480)
-        assert vision_agent.tracking_active is False
-        assert vision_agent.reground_attempts == 3
+        assert vision_agent.tracking_active is True
         
         # Subscribe to TargetNotFoundEvent
         lost_events = []
         bus.subscribe(TargetNotFoundEvent, lambda ev: lost_events.append(ev))
         
-        # Next frame: fails again.
-        # reground_attempts becomes 4 -> triggers TargetNotFoundEvent!
+        # Manually fast-forward lost_target_timestamp to simulate > 1.5s elapsed time
+        import time
+        vision_agent.lost_target_timestamp = time.time() - 2.0
+        
+        # Next frame: elapsed time >= 1.5s -> triggers TargetNotFoundEvent!
         vision_agent._process_object_tracking(frame, 640, 480)
         await asyncio.sleep(0.01)
         assert vision_agent.tracking_active is False
         assert len(lost_events) == 1
+        assert lost_events[0].reason == "lost"
         
         await vision_agent.stop()
         
+    asyncio.run(run_test())
+
+def test_verify_single_person_locks_tracking():
+    async def run_test():
+        config = SystemConfig()
+        config._config["simulation_mode"] = True
+        bus = EventBus()
+        
+        # Start orchestrator
+        orchestrator = OrchestratorAgent(bus, config)
+        await orchestrator.start()
+        
+        # Start vision agent
+        from src.agents.vision_agent import VisionVLMAgent
+        vision_agent = VisionVLMAgent(bus, config)
+        await vision_agent.start()
+        
+        # Initially in IDLE
+        assert orchestrator.state == SystemState.IDLE
+        
+        # Trigger ACOUSTIC_SEEK via SoundLocalizedEvent
+        await bus.publish(SoundLocalizedEvent(angle=45.0, confidence=0.9))
+        await asyncio.sleep(0.01)
+        assert orchestrator.state == SystemState.ACOUSTIC_SEEK
+        
+        # Transition to VISUAL_VERIFYING via MotionDoneEvent
+        await bus.publish(MotionDoneEvent())
+        await asyncio.sleep(0.01)
+        assert orchestrator.state == SystemState.VISUAL_VERIFYING
+        
+        # Set mock session to exactly 1 face
+        vision_agent._face_session.face_present = True
+        vision_agent.current_pan = 45.0  # Simulated position
+        vision_agent._face_session.face_count = 1
+        
+        # Subscribe to TargetVerifiedEvent
+        verified_events = []
+        bus.subscribe(TargetVerifiedEvent, lambda ev: verified_events.append(ev))
+        
+        # Execute face verification on a mock frame
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        vision_agent._process_face_verification(frame, 640, 480, threshold=0.5)
+        await asyncio.sleep(0.02)
+        
+        # Should verify and transition to VLM_TRACKING
+        assert len(verified_events) == 1
+        assert orchestrator.state == SystemState.VLM_TRACKING
+        
+        await vision_agent.stop()
+        await orchestrator.stop()
+
+    asyncio.run(run_test())
+
+def test_verify_multiple_persons_aborts_to_home():
+    async def run_test():
+        config = SystemConfig()
+        config._config["simulation_mode"] = True
+        bus = EventBus()
+        
+        # Start orchestrator
+        orchestrator = OrchestratorAgent(bus, config)
+        await orchestrator.start()
+        
+        # Start vision agent
+        from src.agents.vision_agent import VisionVLMAgent
+        vision_agent = VisionVLMAgent(bus, config)
+        await vision_agent.start()
+        
+        # Start servo agent to listen to MoveHomeCommand
+        from src.agents.servo_agent import ServoActuatorAgent
+        servo_agent = ServoActuatorAgent(bus, config)
+        await servo_agent.start()
+        
+        # Move state to VISUAL_VERIFYING
+        await bus.publish(SoundLocalizedEvent(angle=45.0, confidence=0.9))
+        await asyncio.sleep(0.01)
+        await bus.publish(MotionDoneEvent())
+        await asyncio.sleep(0.01)
+        assert orchestrator.state == SystemState.VISUAL_VERIFYING
+        
+        # Set mock session to 2 faces (multiple people)
+        vision_agent._face_session.face_present = True
+        vision_agent._face_session.face_count = 2
+        
+        # Subscribe to TargetNotFoundEvent
+        lost_events = []
+        bus.subscribe(TargetNotFoundEvent, lambda ev: lost_events.append(ev))
+        
+        # Execute face verification on a mock frame
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        vision_agent._process_face_verification(frame, 640, 480, threshold=0.5)
+        await asyncio.sleep(0.2)
+        
+        # TargetNotFoundEvent should be published immediately
+        assert len(lost_events) == 1
+        assert lost_events[0].reason == "multiple_persons"
+        
+        # Orchestrator transitions to RESETTING and commands MoveHome, then to IDLE once done
+        assert orchestrator.state in (SystemState.RESETTING, SystemState.IDLE)
+        assert servo_agent.current_pan == 0.0
+        assert servo_agent.current_tilt == 0.0
+        
+        await vision_agent.stop()
+        await orchestrator.stop()
+        await servo_agent.stop()
+
+    asyncio.run(run_test())
+
+def test_voice_command_track_dispatch():
+    async def run_test():
+        config = SystemConfig()
+        config._config["simulation_mode"] = True
+        config._config["audio"]["enable_voice_commands"] = True
+        config._config["audio"]["enable_wake_word"] = False
+        bus = EventBus()
+        
+        # Start orchestrator
+        orchestrator = OrchestratorAgent(bus, config)
+        await orchestrator.start()
+        
+        # Start audio agent
+        from src.agents.audio_agent import AudioSensingAgent
+        audio_agent = AudioSensingAgent(bus, config)
+        await audio_agent.start()
+        
+        # Set mock transcription to "track cup"
+        from src.tests.mocks import MockASREngine
+        MockASREngine.mock_transcription = "track cup"
+        
+        # Subscribe to TrackCommand
+        track_commands = []
+        bus.subscribe(TrackCommand, lambda cmd: track_commands.append(cmd))
+        
+        # Manually trigger process voice transcription with dummy buffer
+        dummy_buffer = np.zeros(16000, dtype=np.float32)
+        await audio_agent._process_voice_transcription(dummy_buffer)
+        await asyncio.sleep(0.02)
+        
+        # Should have published TrackCommand with prompt "cup"
+        assert len(track_commands) == 1
+        assert track_commands[0].prompt == "cup"
+        
+        # Orchestrator state should transition to VLM_TRACKING
+        assert orchestrator.state == SystemState.VLM_TRACKING
+        
+        await audio_agent.stop()
+        await orchestrator.stop()
+
+    asyncio.run(run_test())
+
+def test_voice_command_home_dispatch():
+    async def run_test():
+        config = SystemConfig()
+        config._config["simulation_mode"] = True
+        config._config["audio"]["enable_voice_commands"] = True
+        config._config["audio"]["enable_wake_word"] = False
+        bus = EventBus()
+        
+        # Start orchestrator
+        orchestrator = OrchestratorAgent(bus, config)
+        await orchestrator.start()
+        
+        # Start audio agent
+        from src.agents.audio_agent import AudioSensingAgent
+        audio_agent = AudioSensingAgent(bus, config)
+        await audio_agent.start()
+        
+        # Move orchestrator to VLM_TRACKING state first
+        await bus.publish(TrackCommand(prompt="book"))
+        await asyncio.sleep(0.01)
+        assert orchestrator.state == SystemState.VLM_TRACKING
+        
+        # Set mock transcription to "go home"
+        from src.tests.mocks import MockASREngine
+        MockASREngine.mock_transcription = "go home"
+        
+        # Subscribe to MoveHomeCommand
+        home_commands = []
+        bus.subscribe(MoveHomeCommand, lambda cmd: home_commands.append(cmd))
+        
+        # Trigger
+        dummy_buffer = np.zeros(16000, dtype=np.float32)
+        await audio_agent._process_voice_transcription(dummy_buffer)
+        await asyncio.sleep(0.02)
+        
+        # Should have published MoveHomeCommand
+        assert len(home_commands) == 1
+        
+        # State should transition to RESETTING
+        assert orchestrator.state == SystemState.RESETTING
+        
+        await audio_agent.stop()
+        await orchestrator.stop()
+
+    asyncio.run(run_test())
+
+def test_wake_word_single_shot():
+    async def run_test():
+        config = SystemConfig()
+        config._config["simulation_mode"] = True
+        config._config["audio"]["enable_voice_commands"] = True
+        config._config["audio"]["enable_wake_word"] = True
+        config._config["audio"]["wake_word"] = "sentry"
+        bus = EventBus()
+        
+        # Start orchestrator and audio agent
+        orchestrator = OrchestratorAgent(bus, config)
+        await orchestrator.start()
+        
+        from src.agents.audio_agent import AudioSensingAgent
+        audio_agent = AudioSensingAgent(bus, config)
+        await audio_agent.start()
+        
+        # Subscribe to TrackCommand
+        track_commands = []
+        bus.subscribe(TrackCommand, lambda cmd: track_commands.append(cmd))
+        
+        # Simulate saying: "sentry track bottle"
+        await bus.publish(SimulateSpeechCommand(text="sentry track bottle"))
+        await asyncio.sleep(0.05)
+        
+        # Assert TrackCommand was immediately dispatched and wake active is false
+        assert len(track_commands) == 1
+        assert track_commands[0].prompt == "bottle"
+        assert not audio_agent._wake_active
+        assert orchestrator.state == SystemState.VLM_TRACKING
+        
+        await audio_agent.stop()
+        await orchestrator.stop()
+
+    asyncio.run(run_test())
+
+def test_wake_word_two_stage_with_timeout():
+    async def run_test():
+        config = SystemConfig()
+        config._config["simulation_mode"] = True
+        config._config["audio"]["enable_voice_commands"] = True
+        config._config["audio"]["enable_wake_word"] = True
+        config._config["audio"]["wake_word"] = "sentry"
+        config._config["audio"]["wake_timeout_seconds"] = 0.1 # Short timeout for test speed
+        bus = EventBus()
+        
+        # Start orchestrator and audio agent
+        orchestrator = OrchestratorAgent(bus, config)
+        await orchestrator.start()
+        
+        from src.agents.audio_agent import AudioSensingAgent
+        audio_agent = AudioSensingAgent(bus, config)
+        await audio_agent.start()
+        
+        # Subscribe to VoiceCommandEvent to monitor HUD update
+        hud_updates = []
+        bus.subscribe(VoiceCommandEvent, lambda ev: hud_updates.append(ev))
+        
+        # 1. Simulate saying wake word alone: "sentry"
+        await bus.publish(SimulateSpeechCommand(text="sentry"))
+        await asyncio.sleep(0.02)
+        
+        # Assert wake state is active and listening status was sent to HUD
+        assert audio_agent._wake_active
+        assert any(ev.transcript == "listening..." for ev in hud_updates)
+        
+        # 2. Wait for timeout window to expire
+        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.05) # Allow event loop to process disarm event
+        
+        # Assert wake state was cleared automatically and reset banner was sent
+        assert not audio_agent._wake_active
+        assert hud_updates[-1].transcript == ""
+        
+        await audio_agent.stop()
+        await orchestrator.stop()
+
+    asyncio.run(run_test())
+
+
+def test_semantic_routing_and_calibration():
+    async def run_test():
+        config = SystemConfig()
+        config._config["simulation_mode"] = True
+        config._config["audio"]["auto_calibrate_vad"] = True
+        config._config["audio"]["vad_margin_db"] = 10.0
+        config._config["audio"]["fallback_vad_threshold_db"] = -55.0
+        bus = EventBus()
+
+        # 1. Test Audio Calibration and Telemetry Publishing
+        from src.agents.audio_agent import AudioSensingAgent
+        audio_agent = AudioSensingAgent(bus, config)
+        
+        audio_events = []
+        bus.subscribe(AudioLevelEvent, lambda ev: audio_events.append(ev))
+
+        await audio_agent.start()
+        # Give it a moment to run calibration (10 chunks) and publish levels (needs >13 chunks * 64ms = 832ms)
+        await asyncio.sleep(1.2)
+
+        assert audio_agent.ambient_noise_floor_db is not None
+        assert -70.0 <= audio_agent.ambient_noise_floor_db <= -45.0
+        assert audio_agent.dynamic_vad_threshold == audio_agent.ambient_noise_floor_db + 10.0
+        
+        # AudioLevelEvent should have been published
+        assert len(audio_events) > 0
+        assert audio_events[0].noise_floor == audio_agent.ambient_noise_floor_db
+
+        await audio_agent.stop()
+
+        # 2. Test Vision Semantic Routing
+        from src.agents.vision_agent import VisionVLMAgent
+        vision_agent = VisionVLMAgent(bus, config)
+        await vision_agent.start()
+
+        import numpy as np
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        # Case A: Track face -> routes to YuNet Face
+        await bus.publish(TrackCommand(prompt="face"))
+        await asyncio.sleep(0.02)
+        assert vision_agent.tracking_prompt == "face"
+        
+        vision_agent._run_grounding(dummy_frame, 640, 480)
+        assert vision_agent._active_routing_engine == "YuNet Face"
+
+        # Case B: Track person -> routes to YOLO-World (grounding prompt "person")
+        await bus.publish(TrackCommand(prompt="guy"))
+        await asyncio.sleep(0.02)
+        assert vision_agent.tracking_prompt == "guy"
+        
+        vision_agent._run_grounding(dummy_frame, 640, 480)
+        assert vision_agent._active_routing_engine == "YOLO-World"
+
+        # Case C: Re-anchoring engine memory
+        # If active routing engine is "YuNet Face", calling _run_grounding again uses YuNet even if prompt changed
+        vision_agent._active_routing_engine = "YuNet Face"
+        vision_agent._run_grounding(dummy_frame, 640, 480)
+        assert vision_agent._active_routing_engine == "YuNet Face"
+
+        await vision_agent.stop()
+
     asyncio.run(run_test())
 

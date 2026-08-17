@@ -181,13 +181,12 @@ class ServoActuatorAgent(BaseAgent):
 
     def _angle_to_ticks(self, angle, min_angle, max_angle) -> int:
         """Helper to map angle in degrees to 12-bit PCA9685 ticks (150 to 600)."""
-        # Linear interpolation from [min_angle, max_angle] to [150, 600]
+        # Standard proportional mapping where center 0.0 degrees maps to 375 ticks
+        # and physical servo range is 180 degrees (from -90 to 90 mapping to 150 to 600 ticks).
+        # This translates to a direct mapping of (600 - 150) / 180 = 2.5 ticks per degree.
         min_ticks = 150
         max_ticks = 600
-        
-        # Calculate ratio
-        ratio = (angle - min_angle) / (max_angle - min_angle if max_angle != min_angle else 1.0)
-        ticks = min_ticks + ratio * (max_ticks - min_ticks)
+        ticks = 375 + angle * 2.5
         return int(clamp(ticks, min_ticks, max_ticks))
 
     def _start_move(self, target_pan, target_tilt):
