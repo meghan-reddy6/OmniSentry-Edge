@@ -6,11 +6,9 @@ vision:
   detector_model_path: "models/yolov8_det.onnx"
   face_model_path: "models/face_detector.onnx"
   camera_index: 0
-  confidence_threshold: 0.30
+  confidence_threshold: 0.35
   nms_threshold: 0.45
   target_fps: 30
-  frame_width: 640
-  frame_height: 640
 
 audio:
   asr_model_path: "models/whisper_tiny_en_int8.onnx"
