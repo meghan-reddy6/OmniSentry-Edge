@@ -1,28 +1,74 @@
-# Byte-compiled / optimized / DLL files
+# ==========================================
+# Byte-compiled / Python artifacts
+# ==========================================
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+build/
+dist/
+*.egg-info/
 
-# Virtual environments
+# ==========================================
+# Virtual Environments
+# ==========================================
 .venv/
 venv/
 ENV/
 env/
+env.bak/
+venv.bak/
 
-# Large model binaries
-models/
+# ==========================================
+# Models Directory (Allow LFS Tracked Models)
+# ==========================================
+# Ignore arbitrary large archives/temp model artifacts
+models/*.tar.gz
+models/*.zip
+models/*.tmp
+models/download_*
 
-# Local diagnostic logs
+# Explicitly track essential model types managed by Git LFS
+!models/
+!models/*.onnx
+!models/*.data
+!models/*.gguf
+
+# ==========================================
+# Local Runtime Logs & Telemetry
+# ==========================================
 *.log
 sensing_head.log
+logs/
+*.pid
 
-# Testing caches
+# ==========================================
+# Testing & Code Coverage
+# ==========================================
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
+.tox/
+.hypothesis/
 
-# Editor / OS specifics
+# ==========================================
+# IDEs, Editors & OS Files
+# ==========================================
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# ==========================================
+# Hardware & Temporary Media Captures
+# ==========================================
+captures/
+recordings/
+*.raw
+*.pcm
+AGENTS.md

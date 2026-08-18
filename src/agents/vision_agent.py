@@ -5,6 +5,7 @@ and open-vocabulary object tracking (YOLO-World + lightweight CSRT tracking).
 Provides a non-blocking annotated Web video stream and visual diagnostic HUD overlays.
 """
 import asyncio
+import os
 import logging
 import threading
 import time
@@ -21,6 +22,154 @@ from src.common.messages import (
 )
 
 logger = logging.getLogger(__name__)
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+class MockNode:
+    def __init__(self, name, shape, type="tensor(uint8)"):
+        self.name = name
+        self.shape = shape
+        self.type = type
+
+class MockInferenceSession:
+    def __init__(self, model_path=None):
+        self.model_path = model_path
+        self.face_present = True
+        self.object_present = True
+        self.face_count = 1
+        self.current_pan = 0.0
+        self.current_tilt = 0.0
+    def get_inputs(self):
+        return [MockNode("images", [1, 3, 640, 640])]
+    def get_outputs(self):
+        return [MockNode("output0", [1, 84, 8400])]
+    def run(self, output_names=None, input_feed=None):
+        return [np.zeros((1, 84, 8400), dtype=np.float32)]
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    """Multi-threaded HTTP server enabling non-blocking diagnostics page handling."""
+    daemon_threads = True
+
+class MJPEGHandler(BaseHTTPRequestHandler):
+    """Serves the real-time annotated OpenCV frame buffer as an MJPEG multipart HTTP stream."""
+    def log_message(self, format, *args):
+        # Override to suppress printing individual frame requests to stdout
+        pass
+
+    def do_GET(self):
+        if self.path == "/stream":
+            logger.info("Diagnostics Web Client connected to preview stream.")
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+            try:
+                while True:
+                    jpeg_bytes = self.server.vision_agent.get_latest_jpeg()
+                    if jpeg_bytes is None:
+                        time.sleep(0.01)
+                        continue
+                    
+                    self.wfile.write(b"--frame\r\n")
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(jpeg_bytes)))
+                    self.end_headers()
+                    self.wfile.write(jpeg_bytes)
+                    self.wfile.write(b"\r\n")
+                    # Cap transmission rate to ~30 FPS to reduce bandwidth load
+                    time.sleep(0.033)
+            except (ConnectionResetError, BrokenPipeError):
+                logger.info("Diagnostics Web Client disconnected from stream.")
+            except Exception as e:
+                logger.error(f"Error in MJPEG handler stream loop: {e}")
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not Found")
+
+def compute_nms(boxes, scores, overlap_thresh=0.3):
+    """
+    Applies Non-Maximum Suppression (NMS) on bounding boxes.
+    boxes: list or array of [x, y, w, h]
+    scores: list or array of confidence scores
+    """
+    if len(boxes) == 0:
+        return []
+    
+    boxes = np.array(boxes, dtype=np.float32)
+    scores = np.array(scores, dtype=np.float32)
+    
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 0] + boxes[:, 2]
+    y2 = boxes[:, 1] + boxes[:, 3]
+    
+    areas = (x2 - x1) * (y2 - y1)
+    idxs = np.argsort(scores)[::-1]
+    
+    pick = []
+    while len(idxs) > 0:
+        last = len(idxs) - 1
+        i = idxs[0]
+        pick.append(i)
+        
+        xx1 = np.maximum(x1[i], x1[idxs[1:]])
+        yy1 = np.maximum(y1[i], y1[idxs[1:]])
+        xx2 = np.minimum(x2[i], x2[idxs[1:]])
+        yy2 = np.minimum(y2[i], y2[idxs[1:]])
+        
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        
+        intersection = w * h
+        union = areas[i] + areas[idxs[1:]] - intersection
+        union = np.maximum(union, 1e-6)
+"""
+Vision and VLM Agent.
+Captures camera frames and performs hardware-accelerated face detection (YuNet)
+and open-vocabulary object tracking (YOLO-World + lightweight CSRT tracking).
+Provides a non-blocking annotated Web video stream and visual diagnostic HUD overlays.
+"""
+import asyncio
+import os
+import logging
+import threading
+import time
+import numpy as np
+import cv2
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import socketserver
+from src.common.bus import BaseAgent, EventBus
+from src.common.config import SystemConfig
+from src.common.messages import (
+    Event, VerifyFaceCommand, TargetVerifiedEvent, TargetNotFoundEvent,
+    TrackingErrorEvent, TrackCommand, StateChangedEvent, SystemState,
+    ServoPositionEvent, VoiceCommandEvent, AudioLevelEvent
+)
+
+logger = logging.getLogger(__name__)
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+class MockNode:
+    def __init__(self, name, shape, type="tensor(uint8)"):
+        self.name = name
+        self.shape = shape
+        self.type = type
+
+class MockInferenceSession:
+    def __init__(self, model_path=None):
+        self.model_path = model_path
+        self.face_present = True
+        self.object_present = True
+        self.face_count = 1
+        self.current_pan = 0.0
+        self.current_tilt = 0.0
+    def get_inputs(self):
+        return [MockNode("images", [1, 3, 640, 640])]
+    def get_outputs(self):
+        return [MockNode("output0", [1, 84, 8400])]
+    def run(self, output_names=None, input_feed=None):
+        return [np.zeros((1, 84, 8400), dtype=np.float32)]
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     """Multi-threaded HTTP server enabling non-blocking diagnostics page handling."""
@@ -105,6 +254,76 @@ def compute_nms(boxes, scores, overlap_thresh=0.3):
         
     return pick
 
+def decode_yolov8_predictions(raw_outputs, orig_w, orig_h, conf_thresh=0.30, iou_thresh=0.45):
+    # Map outputs by index or name
+    raw_boxes = np.squeeze(raw_outputs[0])      # (8400, 4), uint8
+    raw_scores = np.squeeze(raw_outputs[1])     # (8400,), uint8
+    raw_class_idx = np.squeeze(raw_outputs[2])  # (8400,), uint8
+
+    # Convert uint8 scores [0..255] to float32 [0.0..1.0]
+    confidences = raw_scores.astype(np.float32) / 255.0
+    class_ids = raw_class_idx.astype(np.int32)
+
+    # Filter candidates by confidence threshold
+    mask = confidences >= conf_thresh
+    if not np.any(mask):
+        return [], [], []
+
+    valid_boxes = raw_boxes[mask].astype(np.float32)
+    valid_confs = confidences[mask]
+    valid_cids = class_ids[mask]
+
+    scale_x = float(orig_w) / 640.0
+    scale_y = float(orig_h) / 640.0
+
+    boxes_xywh = []
+    for b in valid_boxes:
+        # Qualcomm uint8 boxes are scaled across the [0..255] range for 640x640 space
+        # b_640 = b * (640.0 / 255.0)
+        c0 = b[0] * (640.0 / 255.0)
+        c1 = b[1] * (640.0 / 255.0)
+        c2 = b[2] * (640.0 / 255.0)
+        c3 = b[3] * (640.0 / 255.0)
+
+        # Check if coordinates represent corners [x1, y1, x2, y2]
+        if c2 > c0 and c3 > c1 and (c2 - c0 < 620):
+            x1 = int(c0 * scale_x)
+            y1 = int(c1 * scale_y)
+            w = int((c2 - c0) * scale_x)
+            h = int((c3 - c1) * scale_y)
+        else:
+            # Format is [cx, cy, w, h]
+            cx = c0 * scale_x
+            cy = c1 * scale_y
+            bw = c2 * scale_x
+            bh = c3 * scale_y
+            x1 = int(cx - bw / 2.0)
+            y1 = int(cy - bh / 2.0)
+            w = int(bw)
+            h = int(bh)
+
+        # Discard false full-frame boxes
+        if w >= int(orig_w * 0.92) and h >= int(orig_h * 0.92):
+            continue
+
+        x1 = max(0, min(orig_w - 5, x1))
+        y1 = max(0, min(orig_h - 5, y1))
+        w = max(10, min(orig_w - x1, w))
+        h = max(10, min(orig_h - y1, h))
+
+        boxes_xywh.append([x1, y1, w, h])
+
+    indices = cv2.dnn.NMSBoxes(boxes_xywh, valid_confs.tolist(), conf_thresh, iou_thresh)
+
+    final_boxes, final_confs, final_classes = [], [], []
+    if len(indices) > 0:
+        for idx in indices.flatten():
+            final_boxes.append(boxes_xywh[idx])
+            final_confs.append(float(valid_confs[idx]))
+            final_classes.append(int(valid_cids[idx]))
+
+    return final_boxes, final_confs, final_classes
+
 class VisionVLMAgent(BaseAgent):
     """
     Executes NPU-accelerated face verification and VLM tracking loops.
@@ -120,9 +339,7 @@ class VisionVLMAgent(BaseAgent):
         self.current_state = SystemState.IDLE
         self.tracking_active = False
         self.tracking_prompt = None
-        self.tracker = None
-        self.reground_attempts = 0
-        self.tracking_frame_count = 0
+        self.last_target_seen_time = None
         
         # ONNX sessions
         self._face_session = None
@@ -152,6 +369,7 @@ class VisionVLMAgent(BaseAgent):
         self.last_audio_rms = -100.0
         self.calibrated_noise_floor = -55.0
         self._active_routing_engine = "None"
+        self._simulation_camera = False
         
         # Subscribe to Orchestrator state changes and commands
         self.subscribe(StateChangedEvent)
@@ -160,8 +378,41 @@ class VisionVLMAgent(BaseAgent):
         self.subscribe(ServoPositionEvent)
         self.subscribe(VoiceCommandEvent)
         self.subscribe(AudioLevelEvent)
+        
+    def _get_default_coco_labels(self) -> list[str]:
+        return [
+            "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+            "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+            "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+            "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+            "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+            "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+            "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake",
+            "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop",
+            "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+            "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+            "toothbrush"
+        ]
+
+    def _load_labels(self, labels_path: str) -> list[str]:
+        import os
+        if not os.path.exists(labels_path):
+            logger.warning(f"Labels file missing at {labels_path}, using built-in COCO-80 fallback.")
+            return self._get_default_coco_labels()
+        with open(labels_path, "r", encoding="utf-8") as f:
+            labels = [line.strip().lower() for line in f if line.strip() and not line.startswith("#")]
+        if len(labels) < 80:
+            logger.warning(f"Labels file has only {len(labels)} classes. Falling back to standard COCO-80.")
+            return self._get_default_coco_labels()
+        return labels
 
     async def setup(self):
+        import os
+        from src.common.config import ROOT_DIR
+        labels_path = os.path.join(ROOT_DIR, "models", "labels.txt")
+        self.labels = self._load_labels(labels_path)
+        logger.info(f"[VisionAgent]: Active tracking labels size: {len(self.labels)}")
+        
         logger.info("Setting up VisionVLMAgent...")
         self.event_loop = asyncio.get_running_loop()
         
@@ -211,11 +462,8 @@ class VisionVLMAgent(BaseAgent):
             if self.current_state != SystemState.VLM_TRACKING:
                 self.tracking_active = False
                 self.tracking_prompt = None
-                self.tracker = None
                 self._last_target_box = None
                 self._last_error = None
-                self.reground_attempts = 0
-                self.tracking_frame_count = 0
                 self.lost_target_timestamp = None
                 
             # Clear detected faces if not in verification state
@@ -228,8 +476,8 @@ class VisionVLMAgent(BaseAgent):
         elif isinstance(event, TrackCommand):
             logger.info(f"Received command to track object: '{event.prompt}'")
             self.tracking_prompt = event.prompt
-            self.tracking_active = False  # Will trigger a new VLM grounding step
-            self.tracker = None
+            self.tracking_active = True
+            self.last_target_seen_time = time.time()
             self._last_target_box = None
             self._last_error = None
             self._active_routing_engine = "None"
@@ -250,19 +498,25 @@ class VisionVLMAgent(BaseAgent):
         if self._web_server is not None:
             return
         try:
-            self._web_server = ThreadedHTTPServer(('', self.web_port), MJPEGHandler)
+            self._web_server = ThreadedHTTPServer(('0.0.0.0', self.web_port), MJPEGHandler)
             self._web_server.vision_agent = self
             self._web_server_thread = threading.Thread(target=self._web_server.serve_forever, daemon=True)
             self._web_server_thread.start()
-            logger.info(f"Diagnostics HTTP stream server running at http://localhost:{self.web_port}/stream")
+            logger.info(f"[VisionAgent]: Diagnostics HTTP stream live at http://0.0.0.0:{self.web_port}/stream")
         except Exception as e:
             logger.error(f"Failed to boot MJPEG stream server on port {self.web_port}: {e}")
 
     def _init_onnx_sessions(self):
         """Initializes model inference sessions using CPU or QNN EP fallback."""
         vision_cfg = self.config.vision
-        face_path = vision_cfg.get("face_model_path", "models/face_detection_yunet_2023mar.onnx")
-        vlm_path = vision_cfg.get("vlm_model_path", "models/yolo_world_s_int8.onnx")
+        face_path = vision_cfg.get("face_model_path", "models/face_detector.onnx")
+        vlm_path = vision_cfg.get("detector_model_path", vision_cfg.get("vlm_model_path", "models/yolov8_det.onnx"))
+        
+        # Absolute path resolution
+        if not os.path.isabs(face_path):
+            face_path = os.path.join(ROOT_DIR, face_path)
+        if not os.path.isabs(vlm_path):
+            vlm_path = os.path.join(ROOT_DIR, vlm_path)
         
         use_mock = self.config.simulation_mode
         ort_lib = None
@@ -276,25 +530,26 @@ class VisionVLMAgent(BaseAgent):
                 use_mock = True
 
         if use_mock:
-            from src.tests.mocks import MockInferenceSession
-            self._face_session = MockInferenceSession(face_path)
-            self._vlm_session = MockInferenceSession(vlm_path)
+            try:
+                from src.common.mocks import MockInferenceSession as HighFidelityMockSession
+                self._face_session = HighFidelityMockSession(face_path)
+                self._vlm_session = HighFidelityMockSession(vlm_path)
+            except ImportError:
+                self._face_session = MockInferenceSession(face_path)
+                self._vlm_session = MockInferenceSession(vlm_path)
             logger.info("ONNX Runtime sessions initialized in SIMULATION mode.")
             return
 
-        # Hardware mode: Initialize YuNet using OpenCV's FaceDetectorYN class
+        # Hardware mode: Initialize Face Detector using ONNX Runtime
         try:
-            self._face_session = cv2.FaceDetectorYN.create(
-                model=face_path,
-                config="",
-                input_size=(640, 480), # default initial size
-                score_threshold=0.6,
-                nms_threshold=0.3
+            self._face_session = ort_lib.InferenceSession(
+                face_path,
+                providers=["QNNExecutionProvider", "CPUExecutionProvider"],
+                provider_options=[{"backend_path": "libqnn_hp.so"}, {}]
             )
-            logger.info("Loaded YuNet Face Detector via OpenCV FaceDetectorYN.")
+            logger.info("Loaded Face Detector via ONNX Runtime.")
         except Exception as e:
-            logger.error(f"Failed to load YuNet via cv2.FaceDetectorYN: {e}. Trying raw ONNX Runtime fallback.")
-            # Raw ORT fallback if FaceDetectorYN fails
+            logger.warning(f"Could not load Face Detector with QNN EP: {e}. Falling back to CPU.")
             try:
                 self._face_session = ort_lib.InferenceSession(face_path, providers=['CPUExecutionProvider'])
             except Exception as ex:
@@ -313,6 +568,41 @@ class VisionVLMAgent(BaseAgent):
             logger.warning(f"Could not load YOLO-World with QNN EP: {e}. Falling back to CPU.")
             self._vlm_session = ort_lib.InferenceSession(vlm_path, providers=['CPUExecutionProvider'])
 
+    def _setup_camera(self, configured_idx, width, height):
+        """Attempts to open a camera, prober sequence: configured first, then 2, 4, 1, 0."""
+        self._simulation_camera = False
+        
+        # Candidate list: configured index first, then others without duplicating
+        candidates = [configured_idx]
+        for idx in [2, 4, 1, 0]:
+            if idx not in candidates:
+                candidates.append(idx)
+                
+        cap = None
+        for idx in candidates:
+            logger.info(f"Attempting to open camera at index {idx}...")
+            try:
+                test_cap = cv2.VideoCapture(idx)
+                if test_cap and test_cap.isOpened():
+                    # Test read a frame to ensure it is not empty
+                    ret, frame = test_cap.read()
+                    if ret and frame is not None:
+                        test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                        test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                        logger.info(f"[VisionAgent]: Successfully attached to camera at index {idx}")
+                        cap = test_cap
+                        break
+                    else:
+                        test_cap.release()
+            except Exception as e:
+                logger.debug(f"Camera open failed on index {idx}: {e}")
+                
+        if cap is None:
+            logger.warning("[VisionAgent]: No physical webcam found. Falling back to synthetic simulation frames.")
+            self._simulation_camera = True
+            
+        return cap
+
     def _run_vision_pipeline(self):
         """Background thread video grab and inference execution loop."""
         vision_cfg = self.config.vision
@@ -321,18 +611,13 @@ class VisionVLMAgent(BaseAgent):
         height = vision_cfg.get("frame_height", 480)
         verify_threshold = vision_cfg.get("verify_threshold", 0.5)
 
-        # Open camera
-        cap = cv2.VideoCapture(camera_idx)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        # Open camera using resilient auto-prober
+        cap = self._setup_camera(camera_idx, width, height)
         
-        if not cap.isOpened():
-            logger.error(f"Failed to open video capture device at index {camera_idx}.")
-            if not self.config.simulation_mode:
-                logger.critical("Webcam unavailable, vision thread aborting.")
-                return
+        if self._simulation_camera or cap is None or not cap.isOpened():
+            logger.info("Vision pipeline running in simulation frame loop.")
         else:
-            logger.info(f"Video capture device opened successfully at index {camera_idx}.")
+            logger.info("Video capture device opened successfully.")
 
         prev_frame_time = time.time()
 
@@ -340,9 +625,9 @@ class VisionVLMAgent(BaseAgent):
             start_time = time.time()
             
             # Grab frame
-            ret, frame = cap.read()
+            ret, frame = cap.read() if (cap is not None and not self._simulation_camera) else (False, None)
             if not ret or frame is None:
-                if self.config.simulation_mode:
+                if self.config.simulation_mode or self._simulation_camera:
                     # Synthesize a camera frame (dark environment)
                     frame = np.zeros((height, width, 3), dtype=np.uint8)
                     cv2.putText(frame, "SIMULATOR ACTIVE", (width - 150, height - 15), 
@@ -395,7 +680,7 @@ class VisionVLMAgent(BaseAgent):
                 try:
                     cv2.imshow("RubikPi 3 Tracking Feed", frame)
                     cv2.waitKey(1)
-                except cv2.error as e:
+                except Exception as e:
                     logger.warning(
                         "cv2.imshow failed (likely running headlessly / missing display server). "
                         f"Falling back to Web Stream Mode on port {self.web_port}. Error: {e}"
@@ -527,168 +812,214 @@ class VisionVLMAgent(BaseAgent):
         return blob
 
     def _detect_faces(self, frame, width, height):
-        """Runs face detection on the frame. Handles both Mock and Real CV2 FaceDetectorYN models."""
+        """Runs face detection on the frame. Handles both Mock and Real MediaPipe Face models."""
         if self.config.simulation_mode:
-            # Mock mode: runs mock inference session
-            # Mock session expects shape [1, N, 15] returned by run()
             self._face_session.current_pan = self.current_pan
             self._face_session.current_tilt = self.current_tilt
             outputs = self._face_session.run(None, None)
-            if outputs and len(outputs[0]) > 0:
-                return outputs[0][0] # Returns array of shape [N, 15]
+            
+            face_present = getattr(self._face_session, "face_present", True)
+            face_count = getattr(self._face_session, "face_count", 1)
+            
+            if outputs and face_present and face_count > 0:
+                detection = np.zeros((face_count, 15), dtype=np.float32)
+                for i in range(face_count):
+                    detection[i, 0] = width / 2 - 30 + i * 80.0
+                    detection[i, 1] = height / 2 - 30
+                    detection[i, 2] = 60
+                    detection[i, 3] = 60
+                    detection[i, 14] = 0.95
+                return detection
             return None
         else:
-            # Real mode: runs OpenCV FaceDetectorYN
             if self._face_session is None:
                 return None
             try:
-                # If the detector is raw ORT session (fallback)
-                if not hasattr(self._face_session, "detect"):
-                    blob = self._preprocess_image_for_model(frame, (640, 640))
-                    input_name = self._face_session.get_inputs()[0].name
-                    outputs = self._face_session.run(None, {input_name: blob})
-                    # Raw session fallback decoder (mocked bounding box)
-                    detection = np.zeros((1, 15), dtype=np.float32)
-                    detection[0, 0] = width / 2 - 30
-                    detection[0, 1] = height / 2 - 30
-                    detection[0, 2] = 60
-                    detection[0, 3] = 60
-                    detection[0, 14] = 0.99
-                    return detection
+                input_node = self._face_session.get_inputs()[0]
+                input_name = input_node.name
+                input_shape = input_node.shape
+                h_in, w_in = input_shape[2], input_shape[3]
                 
-                self._face_session.setInputSize((width, height))
-                retval, faces = self._face_session.detect(frame)
-                if retval > 0 and faces is not None:
-                    return faces
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                resized = cv2.resize(rgb_frame, (w_in, h_in))
+                
+                if "uint8" in input_node.type:
+                    blob = resized.transpose(2, 0, 1).reshape(1, 3, h_in, w_in).astype(np.uint8)
+                else:
+                    blob = ((resized.astype(np.float32) / 127.5) - 1.0).transpose(2, 0, 1).reshape(1, 3, h_in, w_in)
+                    
+                outputs = self._face_session.run(None, {input_name: blob})
+                
+                box_coords_1 = outputs[0]
+                box_coords_2 = outputs[1]
+                box_scores_1 = outputs[2]
+                box_scores_2 = outputs[3]
+                
+                if box_coords_1.dtype == np.uint8:
+                    box_coords_1 = (box_coords_1.astype(np.float32) - 192) * 1.774100
+                if box_coords_2.dtype == np.uint8:
+                    box_coords_2 = (box_coords_2.astype(np.float32) - 86) * 1.977286
+                if box_scores_1.dtype == np.uint8:
+                    box_scores_1 = (box_scores_1.astype(np.float32) - 255) * 12.933325
+                    box_scores_1 = 1.0 / (1.0 + np.exp(-np.clip(box_scores_1, -20.0, 20.0)))
+                if box_scores_2.dtype == np.uint8:
+                    box_scores_2 = (box_scores_2.astype(np.float32) - 243) * 0.358906
+                    box_scores_2 = 1.0 / (1.0 + np.exp(-np.clip(box_scores_2, -20.0, 20.0)))
+                    
+                scores = np.concatenate([box_scores_1[0, :, 0], box_scores_2[0, :, 0]], axis=0)
+                coords = np.concatenate([box_coords_1[0], box_coords_2[0]], axis=0)
+                
+                threshold = 0.65
+                valid_indices = np.where(scores > threshold)[0]
+                
+                if len(valid_indices) > 0:
+                    anchors = []
+                    for y in range(16):
+                        cy = (y + 0.5) / 16.0
+                        for x in range(16):
+                            cx = (x + 0.5) / 16.0
+                            for _ in range(2):
+                                anchors.append((cx, cy))
+                    for y in range(8):
+                        cy = (y + 0.5) / 8.0
+                        for x in range(8):
+                            cx = (x + 0.5) / 8.0
+                            for _ in range(6):
+                                anchors.append((cx, cy))
+                    
+                    nms_boxes = []
+                    nms_scores = []
+                    
+                    for idx in valid_indices:
+                        anchor_cx, anchor_cy = anchors[idx]
+                        raw_y, raw_x, raw_h, raw_w = coords[idx, 0:4]
+                        
+                        x_center = (raw_x / 256.0 + anchor_cx) * width
+                        y_center = (raw_y / 256.0 + anchor_cy) * height
+                        w = (raw_w / 256.0 + 0.2) * width
+                        h = (raw_h / 256.0 + 0.2) * height
+                        
+                        x_min = x_center - w / 2
+                        y_min = y_center - h / 2
+                        nms_boxes.append([int(x_min), int(y_min), int(w), int(h)])
+                        nms_scores.append(float(scores[idx]))
+                        
+                    indices = cv2.dnn.NMSBoxes(nms_boxes, nms_scores, score_threshold=threshold, nms_threshold=0.3)
+                    
+                    if len(indices) > 0:
+                        best_idx = np.array(indices).flatten()[0]
+                        best_box = nms_boxes[best_idx]
+                        best_score = nms_scores[best_idx]
+                        
+                        detection = np.zeros((1, 15), dtype=np.float32)
+                        detection[0, 0] = best_box[0]
+                        detection[0, 1] = best_box[1]
+                        detection[0, 2] = best_box[2]
+                        detection[0, 3] = best_box[3]
+                        detection[0, 14] = best_score
+                        return detection
+                return None
             except Exception as e:
                 now = time.time()
                 if now - getattr(self, "_last_face_error_time", 0.0) > 5.0:
-                    logger.error(f"Error in face detection: {e}. If you are in hardware mode, please run the model downloader WITHOUT the '--dummy' flag to download real model weights.")
+                    logger.error(f"Error in face detection: {e}")
                     self._last_face_error_time = now
             return None
 
-    def is_valid_bbox(self, bbox, min_size=30) -> bool:
-        """Verifies if the bounding box meets minimum dimensions."""
-        if bbox is None or len(bbox) != 4:
-            return False
-        x, y, w, h = bbox
-        return w >= min_size and h >= min_size
-
-    def _run_grounding(self, frame, width, height, threshold=0.30) -> tuple[int, int, int, int] | None:
-        """Runs the face detector or YOLO-World VLM to locate the target prompt."""
-        import os
-        prompt = self.tracking_prompt.lower().strip() if self.tracking_prompt else ""
+    def _run_grounding(self, frame, width, height, threshold=0.30):
+        """Runs the primary YOLOv8 ONNX detector to locate the target prompt."""
+        prompt = self.tracking_prompt.strip().lower().rstrip("\\/\"'") if self.tracking_prompt else ""
+        clean_prompt = prompt
         
         FACE_KEYWORDS = {"face", "head", "human face", "my face", "person face", "eyes"}
         PERSON_KEYWORDS = {"person", "human", "man", "woman", "guy", "girl", "body", "people"}
         
-        is_face = (prompt in FACE_KEYWORDS) or (self._active_routing_engine == "YuNet Face")
-        is_person = (prompt in PERSON_KEYWORDS) or (self._active_routing_engine == "YOLO-World" and prompt in PERSON_KEYWORDS)
-        
-        if is_face:
-            self._active_routing_engine = "YuNet Face"
-            logger.info(f"[VisionAgent]: Routing prompt '{self.tracking_prompt}' directly to high-precision YuNet Face Detector.")
-            faces = self._detect_faces(frame, width, height)
-            if faces is not None and len(faces) > 0:
-                x_min, y_min, w, h = faces[0][0:4]
-                return (int(x_min), int(y_min), int(w), int(h))
-            return None
+        if clean_prompt in FACE_KEYWORDS or clean_prompt in PERSON_KEYWORDS:
+            grounding_prompt = "person"
         else:
-            self._active_routing_engine = "YOLO-World"
-            # YOLO-World VLM object grounding
-            logger.info(f"[VisionAgent]: Executing YOLO-World open-vocabulary grounding for: '{self.tracking_prompt}'")
-            
-            grounding_prompt = "person" if is_person else prompt
-            
-            blob = self._preprocess_image_for_model(frame, (640, 640))
-            blob = blob / 255.0
-            
-            embeddings_path = "models/coco_embeddings.npy"
-            txt_feat = np.zeros((1, 512), dtype=np.float32)
-            
-            if os.path.exists(embeddings_path):
-                try:
-                    embed_dict = np.load(embeddings_path, allow_pickle=True).item()
-                    matched_cls = None
-                    for cls in embed_dict.keys():
-                        if cls == grounding_prompt or cls in grounding_prompt or grounding_prompt in cls:
-                            matched_cls = cls
-                            break
-                    
-                    if matched_cls:
-                        logger.debug(f"Found pre-computed CLIP embedding for matched class: '{matched_cls}'")
-                        txt_feat = embed_dict[matched_cls].reshape(1, 512)
-                    else:
-                        logger.debug(f"No match for prompt '{grounding_prompt}' in COCO classes. Using default ('cup').")
-                        if "cup" in embed_dict:
-                            txt_feat = embed_dict["cup"].reshape(1, 512)
-                except Exception as e:
-                    logger.error(f"Failed to load or query COCO embeddings dictionary: {e}")
+            grounding_prompt = clean_prompt
+                
+        self._active_routing_engine = "Qualcomm YOLOv8-ONNX"
+        
+        if self.config.simulation_mode:
+            if getattr(self._vlm_session, "object_present", True):
+                bbox = (int(width/2 - 40), int(height/2 - 40), 80, 80)
+                logger.debug("Initializing simulated tracking bounding box at frame center.")
             else:
-                logger.warning("COCO embeddings file not found. Pre-computed classes unavailable.")
-            
-            # YOLO-World expects shape [1, num_classes, 512]
-            txt_feats = np.expand_dims(txt_feat, axis=0) # shape: [1, 1, 512]
-            inputs = {
-                "images": blob,
-                "txt_feats": txt_feats
-            }
-            if self.config.simulation_mode:
-                self._vlm_session.current_pan = self.current_pan
-                self._vlm_session.current_tilt = self.current_tilt
-            
-            try:
-                outputs = self._vlm_session.run(None, inputs)
-            except Exception as e:
-                logger.warning(
-                    f"YOLO-World ONNX session run failed: {e}. VLM open-vocabulary grounding "
-                    "for custom objects requires a pre-quantized model with embedded features. "
-                    "Falling back to center bounding box."
-                )
-                outputs = None
-            
-            bbox = None
-            if outputs and len(outputs[0]) > 0:
-                output_tensor = outputs[0]
-                if len(output_tensor.shape) == 3:
-                    # Support both standard YOLO-World output [1, 5, 8400] and dummy output [1, 10, 5]
-                    if output_tensor.shape[2] == 5:
-                        predictions = np.squeeze(output_tensor) # shape: [10, 5]
-                    elif output_tensor.shape[1] == 5:
-                        predictions = np.squeeze(output_tensor).T # shape: [8400, 5]
-                    else:
-                        predictions = np.squeeze(output_tensor)
-                        if len(predictions.shape) == 2 and predictions.shape[0] < predictions.shape[1]:
-                            predictions = predictions.T
-                            
-                    if len(predictions.shape) == 2 and predictions.shape[1] >= 5:
-                        scores = predictions[:, 4]
-                        max_idx = np.argmax(scores)
-                        max_score = scores[max_idx]
-                        
-                        if max_score >= threshold: # Confidence threshold
-                            x_center, y_center, w, h = predictions[max_idx, 0:4]
-                            
-                            scale_x = width / 640.0
-                            scale_y = height / 640.0
-                            
-                            x_min = (x_center - w / 2.0) * scale_x
-                            y_min = (y_center - h / 2.0) * scale_y
-                            box_w = w * scale_x
-                            box_h = h * scale_y
-                            
-                            bbox = (int(x_min), int(y_min), int(box_w), int(box_h))
-                            logger.debug(f"YOLO-World localized target '{grounding_prompt}' with score: {max_score:.3f} -> bbox: {bbox}")
-            
-            if bbox is None:
-                if self.config.simulation_mode:
-                    # Fallback to center box for demo in simulation mode
-                    bbox = (int(width/2 - 40), int(height/2 - 40), 80, 80)
-                    logger.debug("Initializing fallback tracking bounding box at frame center.")
-                else:
-                    logger.debug("YOLO-World grounding failed to find target.")
-            
+                bbox = None
             return bbox
+            
+        input_node = self._vlm_session.get_inputs()[0]
+        input_name = input_node.name
+        
+        # 1. Resize directly to (640, 640)
+        resized = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_LINEAR)
+
+        # 2. Convert BGR -> RGB
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+        # 3. Transpose HWC -> CHW, ensure uint8 type, add batch dimension
+        tensor = np.transpose(rgb, (2, 0, 1)).astype(np.uint8)
+        input_tensor = np.expand_dims(tensor, axis=0)  # Shape: (1, 3, 640, 640), uint8
+            
+        try:
+            outputs = self._vlm_session.run(None, {input_name: input_tensor})
+        except Exception as e:
+            logger.warning(f"YOLOv8 ONNX session run failed: {e}. Falling back.")
+            outputs = None
+            
+        bbox = None
+        if outputs:
+            raw_outputs = outputs
+            
+            conf_thresh = self.config.vision.get("confidence_threshold", threshold)
+            iou_thresh = self.config.vision.get("nms_threshold", 0.45)
+            
+            final_boxes, final_confs, final_classes = decode_yolov8_predictions(
+                raw_outputs, width, height, conf_thresh, iou_thresh
+            )
+            
+            best_target = None
+            highest_score = -1.0
+            
+            for (bx, by, bw, bh), conf, cid in zip(final_boxes, final_confs, final_classes):
+                cls_name = self.labels[cid]
+                # Direct or substring match
+                if (grounding_prompt == cls_name) or (grounding_prompt in cls_name):
+                    if conf > highest_score:
+                        highest_score = conf
+                        best_target = (bx, by, bw, bh, cls_name, conf)
+            
+            if best_target:
+                bx, by, bw, bh, cls_name, conf = best_target
+                
+                # Scale to camera frame size if necessary, but keep calculations at 640x640 for consistency
+                scale_x = width / 640.0
+                scale_y = height / 640.0
+                
+                if clean_prompt in FACE_KEYWORDS and cls_name == "person":
+                    head_w = int(bw * 0.70)
+                    head_h = int(bh * 0.35)
+                    head_x = bx + int(bw * 0.15)
+                    head_y = by
+                    target_cx = head_x + head_w / 2.0
+                    target_cy = head_y + head_h / 2.0
+                    bbox = (int(head_x * scale_x), int(head_y * scale_y), int(head_w * scale_x), int(head_h * scale_y))
+                else:
+                    target_cx = bx + bw / 2.0
+                    target_cy = by + bh / 2.0
+                    bbox = (int(bx * scale_x), int(by * scale_y), int(bw * scale_x), int(bh * scale_y))
+                
+                logger.info(f"[VisionAgent]: Latch confirmed on '{clean_prompt}' at {bbox} (conf: {conf:.2f})")
+                
+                # Emit TrackingErrorEvent natively against 640x640 frame dimensions
+                dx = (target_cx - 320.0) / 320.0
+                dy = (target_cy - 320.0) / 320.0
+                import asyncio
+                event = TrackingErrorEvent(dx=dx, dy=dy)
+                asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
+                    
+        return bbox
 
     def _process_face_verification(self, frame, width, height, threshold):
         """Runs face detection for verifying sound seekers."""
@@ -725,7 +1056,7 @@ class VisionVLMAgent(BaseAgent):
         # Case 2: Exactly One Face Detected (len(filtered_faces) == 1)
         elif len(filtered_faces) == 1:
             face = filtered_faces[0]
-            x_min, y_min, w, h = face[0:4]
+            x_min, y_min, w, h = [int(v) for v in face[0:4]]
             self._last_target_box = (x_min, y_min, w, h)
             
             center_x = x_min + w / 2.0
@@ -736,6 +1067,13 @@ class VisionVLMAgent(BaseAgent):
             self._last_error = (norm_x, norm_y)
             
             logger.info(f"INFO: Single person confirmed at {self._last_target_box}. Engaging tracking.")
+            
+            # Pre-initialize tracking variables directly for zero-latency acoustic-to-visual handover
+            self.tracking_prompt = "face"
+            self.tracking_active = True
+            self.last_target_seen_time = time.time()
+            self._active_routing_engine = "YuNet Face"
+            
             event = TargetVerifiedEvent(center_x=norm_x, center_y=norm_y)
             asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
             return
@@ -746,147 +1084,31 @@ class VisionVLMAgent(BaseAgent):
             self._last_error = None
 
     def _process_object_tracking(self, frame, width, height):
-        """Runs VLM grounding and local tracking with recovery, filtering, and re-anchoring."""
+        """Runs pure ONNX VLM grounding directly on every single frame."""
+        bbox = self._run_grounding(frame, width, height, threshold=0.30)
         
-        # Stage 1: If tracking is active, update the tracker and handle re-anchoring
-        success = False
-        bbox = None
-        
-        if self.tracking_active and self.tracker is not None and self.lost_target_timestamp is None:
-            self.tracking_frame_count += 1
+        if bbox is not None:
+            x, y, w, h = bbox
+            self.last_target_seen_time = time.time()
+            self._last_target_box = bbox
             
-            # Periodic Re-Anchoring (every 30 frames) to prevent drift
-            if self.tracking_frame_count % 30 == 0:
-                logger.debug(f"Frame {self.tracking_frame_count}: Triggering periodic VLM re-anchoring...")
-                # Re-anchoring uses threshold=0.25
-                refreshed_bbox = self._run_grounding(frame, width, height, threshold=0.25)
-                if self.is_valid_bbox(refreshed_bbox, min_size=30):
-                    logger.debug(f"Periodic re-anchoring succeeded. Re-init tracker to: {refreshed_bbox}")
-                    self.tracker = self._create_opencv_tracker()
-                    self.tracker.init(frame, refreshed_bbox)
-                    self._last_target_box = refreshed_bbox
-                else:
-                    logger.debug("Periodic VLM re-anchoring failed/returned invalid box. Continuing with current track.")
-
-            # Update high-speed local tracker
-            success, bbox = self.tracker.update(frame)
-            if success:
-                # Double-check bounding box sanity
-                if self.is_valid_bbox(bbox, min_size=30):
-                    self.lost_target_timestamp = None  # Reset recovery grace timer on successful track
-                    x, y, w, h = [int(v) for v in bbox]
-                    self._last_target_box = (x, y, w, h)
-                    
-                    # Calculate center error delta
-                    center_x = x + w / 2.0
-                    center_y = y + h / 2.0
-                    dx = (center_x - width / 2.0) / (width / 2.0)
-                    dy = (center_y - height / 2.0) / (height / 2.0)
-                    self._last_error = (dx, dy)
-                    
-                    logger.debug(f"Tracking active. Bbox: {bbox}, dx: {dx:+.2f}, dy: {dy:+.2f}")
-                    event = TrackingErrorEvent(dx=dx, dy=dy)
-                    asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
-                    return
-                else:
-                    logger.debug(f"Tracker returned unsafe/too small bounding box: {bbox}. Treating as lock lost.")
-                    success = False
-        
-        # Stage 2: Target Recovery / Initial Grounding Loop
-        if not success:
-            if self.lost_target_timestamp is None:
-                self.lost_target_timestamp = time.time()
-                logger.warning("Visual tracker lost target. Entering recovery grace period.")
+            # Update diagnostic HUD error vector (dx, dy)
+            target_cx = x + w / 2.0
+            target_cy = y + h / 2.0
+            dx = (target_cx - width / 2.0) / (width / 2.0)
+            dy = (target_cy - height / 2.0) / (height / 2.0)
+            self._last_error = (dx, dy)
+        else:
+            if getattr(self, "last_target_seen_time", None) is None:
+                self.last_target_seen_time = time.time()
                 
-            elapsed = time.time() - self.lost_target_timestamp
-            
-            if elapsed < 1.5:
-                # Use threshold=0.30 if we have never locked onto a target, otherwise 0.25
-                thresh = 0.30 if self.tracker is None else 0.25
-                bbox = self._run_grounding(frame, width, height, threshold=thresh)
-                
-                if self.is_valid_bbox(bbox, min_size=30):
-                    logger.info(f"Target successfully located/recovered via VLM. BBox: {bbox}")
-                    self.tracker = self._create_opencv_tracker()
-                    self.tracker.init(frame, bbox)
-                    self.tracking_active = True
-                    self._last_target_box = bbox
-                    self.lost_target_timestamp = None
-                    self.tracking_frame_count = 0
-                    
-                    # Calculate center error delta
-                    x, y, w, h = bbox
-                    center_x = x + w / 2.0
-                    center_y = y + h / 2.0
-                    dx = (center_x - width / 2.0) / (width / 2.0)
-                    dy = (center_y - height / 2.0) / (height / 2.0)
-                    self._last_error = (dx, dy)
-                    
-                    event = TrackingErrorEvent(dx=dx, dy=dy)
-                    asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
-                else:
-                    # Still lost, keep warning HUD rendering
-                    self._last_target_box = None
-                    self._last_error = None
-            else:
+            elapsed = time.time() - self.last_target_seen_time
+            if elapsed > 1.5:
                 logger.warning("Target lost for > 1.5s. Aborting tracking.")
                 self.tracking_active = False
-                self.tracker = None
                 self._last_target_box = None
                 self._last_error = None
-                self.lost_target_timestamp = None
+                self.last_target_seen_time = None
                 
                 event = TargetNotFoundEvent(reason="lost")
                 asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
-
-    def _create_opencv_tracker(self):
-        """Creates configured OpenCV tracker, falling back gracefully to KCF if not compiled."""
-        tracker_type = self.config.vision.get("tracker_type", "KCF").upper()
-        try:
-            if tracker_type == "KCF":
-                try:
-                    return cv2.TrackerKCF_create()
-                except AttributeError:
-                    return cv2.legacy.TrackerKCF_create()
-            elif tracker_type == "CSRT":
-                try:
-                    return cv2.TrackerCSRT_create()
-                except AttributeError:
-                    return cv2.legacy.TrackerCSRT_create()
-            else:
-                # Default to KCF for speed
-                try:
-                    return cv2.TrackerKCF_create()
-                except AttributeError:
-                    return cv2.legacy.TrackerKCF_create()
-        except AttributeError:
-            if not getattr(self, "_tracker_warning_shown", False):
-                logger.warning(f"OpenCV {tracker_type} tracker not compiled in cv2. Using SimpleCentroidTracker fallback.")
-                self._tracker_warning_shown = True
-            return SimpleCentroidTracker()
-
-class SimpleCentroidTracker:
-    """Fallback simulated centroid tracker when CSRT is unavailable."""
-    def __init__(self):
-        self.bbox = None
-
-    def init(self, frame, bbox):
-        self.bbox = list(bbox)
-        return True
-
-    def update(self, frame):
-        if self.bbox is None:
-            return False, None
-        
-        # In mock mode, the target slowly drifts back towards center, simulating tracking
-        x, y, w, h = self.bbox
-        # Simulate slight jitter/movement
-        x += np.random.randint(-2, 3)
-        y += np.random.randint(-2, 3)
-        
-        # Keep inside bounds
-        x = max(0, x)
-        y = max(0, y)
-        self.bbox = [x, y, w, h]
-        
-        return True, tuple(self.bbox)

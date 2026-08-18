@@ -7,6 +7,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Absolute root path detection
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
 # Fallback defaults if config file is missing or values are undefined
 DEFAULT_CONFIG = {
     "simulation_mode": True,
@@ -17,6 +20,7 @@ DEFAULT_CONFIG = {
         "vad_threshold_db": -45.0,  # dB relative to full scale
         "mic_distance": 0.08,       # meters (8 cm)
         "speed_of_sound": 343.0,    # m/s
+        "asr_model_path": os.path.join(ROOT_DIR, "models", "whisper_tiny_en_int8.onnx"),
     },
     "servo": {
         "i2c_bus": 1,
@@ -44,8 +48,9 @@ DEFAULT_CONFIG = {
         "camera_index": 0,
         "frame_width": 640,
         "frame_height": 480,
-        "face_model_path": "models/face_detector.onnx",
-        "vlm_model_path": "models/yolo_world.onnx",
+        "face_model_path": os.path.join(ROOT_DIR, "models", "face_detector.onnx"),
+        "detector_model_path": os.path.join(ROOT_DIR, "models", "yolov8_det.onnx"),
+        "vlm_model_path": os.path.join(ROOT_DIR, "models", "yolov8_det.onnx"),
         "tracking_timeout": 3.0,     # seconds
         "verify_threshold": 0.5,     # Confidence threshold
     }
@@ -54,7 +59,10 @@ DEFAULT_CONFIG = {
 class SystemConfig:
     """System-wide configuration registry."""
     def __init__(self, config_path: str = "config.yaml"):
-        self.config_path = config_path
+        if not os.path.isabs(config_path):
+            self.config_path = os.path.join(ROOT_DIR, config_path)
+        else:
+            self.config_path = config_path
         self._config = DEFAULT_CONFIG.copy()
         self.load_config()
 
@@ -71,6 +79,13 @@ class SystemConfig:
             with open(self.config_path, "r") as f:
                 loaded = yaml.safe_load(f)
                 if loaded and isinstance(loaded, dict):
+                    # Align newer keys with default config structure
+                    if "servos" in loaded and "servo" not in loaded:
+                        loaded["servo"] = loaded["servos"]
+                    if "system" in loaded and isinstance(loaded["system"], dict):
+                        system_mode = loaded["system"].get("mode", "SIMULATION")
+                        loaded["simulation_mode"] = (system_mode == "SIMULATION")
+                    
                     self._update_recursive(self._config, loaded)
                     logger.info(f"Successfully loaded configuration from {self.config_path}")
                 else:

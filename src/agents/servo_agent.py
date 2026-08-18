@@ -18,6 +18,42 @@ logger = logging.getLogger(__name__)
 def clamp(val, min_val, max_val):
     return max(min(val, max_val), min_val)
 
+class SMBusPCA9685:
+    """Lightweight, direct smbus2 controller for PCA9685."""
+    def __init__(self, bus_num, address=0x40):
+        import smbus2
+        import time
+        self.bus = smbus2.SMBus(bus_num)
+        self.address = address
+        
+        # Mode registers
+        MODE1 = 0x00
+        PRESCALE = 0xFE
+        
+        # 1. Set Sleep mode (bit 4 = 1) to write prescale
+        self.bus.write_byte_data(self.address, MODE1, 0x10)
+        time.sleep(0.005)
+        # 2. Set prescale to 0x79 (50Hz PWM frequency)
+        self.bus.write_byte_data(self.address, PRESCALE, 0x79)
+        time.sleep(0.005)
+        # 3. Clear Sleep (bit 4 = 0) and enable Auto-increment (bit 5 = 1)
+        self.bus.write_byte_data(self.address, MODE1, 0x20)
+        time.sleep(0.005)
+        
+    def set_pwm(self, channel, on_tick, off_tick):
+        # ON register start: 0x06 + 4 * channel
+        base = 0x06 + 4 * channel
+        self.bus.write_byte_data(self.address, base, on_tick & 0xFF)
+        self.bus.write_byte_data(self.address, base + 1, (on_tick >> 8) & 0xFF)
+        self.bus.write_byte_data(self.address, base + 2, off_tick & 0xFF)
+        self.bus.write_byte_data(self.address, base + 3, (off_tick >> 8) & 0xFF)
+
+    def close(self):
+        try:
+            self.bus.close()
+        except Exception:
+            pass
+
 class ServoActuatorAgent(BaseAgent):
     """
     Controls Pan/Tilt servo positions based on commands and tracking feedback.
@@ -114,27 +150,40 @@ class ServoActuatorAgent(BaseAgent):
             self._write_servos()
 
     def _init_pca9685(self):
-        """Initializes the PCA9685 board or falls back to mock driver."""
+        """Initializes the PCA9685 board or falls back to SMBus2 driver, then mock driver."""
         servo_cfg = self.config.servo
         bus_num = servo_cfg.get("i2c_bus", 1)
         address = servo_cfg.get("pca9685_address", 0x40)
         
         use_mock = self.config.simulation_mode
-        pca_lib = None
+        self._smbus_mode = False
         
         if not use_mock:
+            # Try adafruit-circuitpython-pca9685 first
             try:
                 import busio
                 import board
                 from adafruit_pca9685 import PCA9685
-                pca_lib = PCA9685
                 i2c = busio.I2C(board.SCL, board.SDA)
                 self.pca = PCA9685(i2c, address=address)
                 self.pca.frequency = 50  # Servos usually run at 50Hz
                 logger.info("PCA9685 hardware driver initialized at I2C address 0x%02X", address)
+                return
             except Exception as e:
                 logger.warning(
-                    f"Failed to initialize PCA9685 hardware on I2C bus: {e}. "
+                    f"Adafruit PCA9685 initialization failed: {e}. "
+                    "Attempting SMBus2 driver fallback..."
+                )
+            
+            # Try SMBus2 fallback driver
+            try:
+                self.pca = SMBusPCA9685(bus_num, address)
+                self._smbus_mode = True
+                logger.info(f"PCA9685 direct SMBus2 driver initialized on I2C bus {bus_num} at address 0x{address:02X}")
+                return
+            except Exception as ex:
+                logger.warning(
+                    f"SMBus2 PCA9685 initialization failed: {ex}. "
                     "Falling back to mock driver."
                 )
                 use_mock = True
@@ -161,8 +210,12 @@ class ServoActuatorAgent(BaseAgent):
         tilt_duty = int(tilt_tick * 16)
         
         try:
-            # Write to channel registers
-            if hasattr(self.pca, "channels"):
+            if getattr(self, "_smbus_mode", False):
+                # Direct SMBus2 driver writes
+                self.pca.set_pwm(self.pan_channel, 0, pan_tick)
+                self.pca.set_pwm(self.tilt_channel, 0, tilt_tick)
+            elif hasattr(self.pca, "channels"):
+                # Adafruit CircuitPython driver writes
                 self.pca.channels[self.pan_channel].duty_cycle = pan_duty
                 self.pca.channels[self.tilt_channel].duty_cycle = tilt_duty
             else:
