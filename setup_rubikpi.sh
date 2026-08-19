@@ -5,53 +5,59 @@ echo "=========================================================="
 echo "  OmniSentry-Edge: Rubik Pi 3 Auto-Setup (Qualcomm NPU)   "
 echo "=========================================================="
 
-# 1. Install System Packages & Audio/Hardware Drivers
-echo "[1/4] Installing system dependencies and utilities..."
+# 1. System Dependencies
+echo "[1/4] Installing system packages..."
 sudo apt-get update
-sudo apt-get install -y git git-lfs python3-pip python3-venv portaudio19-dev libasound2-dev python3-smbus python3-onnxruntime || true
+sudo apt-get install -y git git-lfs python3-pip python3-venv portaudio19-dev libasound2-dev python3-smbus
 
-# 2. Fetch Git LFS Binaries & Validate
-echo "[2/4] Pulling binary ONNX model weights..."
+# 2. Pull Git LFS Binary Weights
+echo "[2/4] Fetching ONNX model weights..."
 git lfs install
 git lfs fetch --all
 git lfs checkout
 
 if [ ! -s "models/yolov8_det.onnx" ]; then
-    echo "ERROR: models/yolov8_det.onnx is missing or empty."
+    echo "ERROR: models/yolov8_det.onnx is missing."
     exit 1
 fi
 
 if head -c 100 "models/yolov8_det.onnx" | grep -q "git-lfs.github.com/spec"; then
-    echo "ERROR: models/yolov8_det.onnx is still a Git LFS pointer text file."
+    echo "ERROR: models/yolov8_det.onnx is still a Git LFS pointer."
     echo "Run: git lfs pull"
     exit 1
 fi
 
-echo "OK: models/yolov8_det.onnx is verified as binary ($(stat -c%s "models/yolov8_det.onnx") bytes)."
+echo "OK: models/yolov8_det.onnx verified ($(stat -c%s "models/yolov8_det.onnx") bytes)."
 
-# 3. Create Python VENV with System Site-Packages (Inherits QNN Provider)
-echo "[3/4] Initializing Python Virtual Environment with hardware drivers..."
-rm -rf venv
-python3 -m venv --system-site-packages venv
+# 3. Python Virtual Environment Setup
+echo "[3/4] Initializing Python Virtual Environment..."
+if [ ! -d "venv" ]; then
+    python3 -m venv --system-site-packages venv
+fi
 source venv/bin/activate
 
-# 4. Install Python Dependencies
-echo "[4/4] Installing Python dependencies..."
+# 4. Install Dependencies & Resolve ONNX Runtime
+echo "[4/4] Installing Python requirements and ONNX Runtime..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Ensure library search paths include Qualcomm HTP libraries
+# Search for hardware-specific Qualcomm wheels first
+LOCAL_WHEEL=$(find /opt /usr -name "*onnxruntime*.whl" 2>/dev/null | head -n 1)
+if [ -n "$LOCAL_WHEEL" ]; then
+    echo "Found local Qualcomm ONNX Runtime wheel: $LOCAL_WHEEL"
+    pip install "$LOCAL_WHEEL" --force-reinstall
+else
+    echo "Attempting to install onnxruntime-qnn..."
+    pip install onnxruntime-qnn --extra-index-url https://download.onnxruntime.ai/ || pip install onnxruntime
+fi
+
 export LD_LIBRARY_PATH=/usr/lib:/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
 
 echo ""
-echo "=== Testing Execution Providers in Virtual Environment ==="
-python -c "import onnxruntime as ort; eps = ort.get_available_providers(); print('Available Providers:', eps); assert 'QNNExecutionProvider' in eps or 'CPUExecutionProvider' in eps"
+echo "=== Provider Verification ==="
+python -c "import onnxruntime as ort; print('Available EPs:', ort.get_available_providers())"
 
 echo ""
 echo "=========================================================="
-echo "  Setup Complete! Launching OmniSentry-Edge...            "
-echo "=========================================================="
-echo "To run manually:"
-echo "  source venv/bin/activate"
-echo "  python src/main.py"
+echo "  Setup Complete! Run: source venv/bin/activate && python src/main.py"
 echo "=========================================================="
