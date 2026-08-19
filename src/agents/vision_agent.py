@@ -324,34 +324,32 @@ def decode_yolov8_predictions(raw_outputs, orig_w, orig_h, conf_thresh=0.30, iou
 
     return final_boxes, final_confs, final_classes
 
-def create_qnn_session(model_path: str):
+def create_inference_session(model_path: str):
     """
-    Initializes ONNX Runtime session prioritized for Qualcomm Hexagon NPU (HTP).
+    Creates an ONNX Runtime inference session prioritizing the Qualcomm Hexagon NPU.
     """
     import onnxruntime as ort
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
     available_providers = ort.get_available_providers()
-    logger.info(f"[VisionAgent]: Available ONNX Providers: {available_providers}")
+    logger.info(f"[VisionAgent]: Available Execution Providers: {available_providers}")
 
-    # Standard shared library search paths for Qualcomm QNN on Ubuntu ARM64
-    qnn_backend = "libQnnHtp.so"
-
+    # Prioritize Qualcomm Hexagon Tensor Processor (HTP) on Rubik Pi 3
     qnn_options = {
-        "backend_path": qnn_backend,
-        "htp_performance_mode": "burst",          # Max clock speed for lowest inference latency
+        "backend_path": "/usr/lib/libQnnHtp.so",
+        "htp_performance_mode": "burst",          # Maximum NPU clock frequency
         "htp_graph_finalization_optimization_mode": "3"
     }
 
     if "QNNExecutionProvider" in available_providers:
-        logger.info(f"[VisionAgent]: Initializing {os.path.basename(model_path)} on Qualcomm Hexagon NPU...")
+        logger.info(f"[VisionAgent]: Offloading {os.path.basename(model_path)} to Qualcomm Hexagon NPU (QNN)...")
         providers = [
             ("QNNExecutionProvider", qnn_options),
             "CPUExecutionProvider"
         ]
     else:
-        logger.warning(f"[VisionAgent]: QNNExecutionProvider unavailable. Falling back to CPU.")
+        logger.warning(f"[VisionAgent]: QNNExecutionProvider unavailable. Falling back to CPUExecutionProvider.")
         providers = ["CPUExecutionProvider"]
 
     session_options = ort.SessionOptions()
@@ -585,12 +583,12 @@ class VisionVLMAgent(BaseAgent):
 
         # Hardware mode: Initialize using QNN Hexagon NPU Helpers
         try:
-            self._face_session = create_qnn_session(face_path)
+            self._face_session = create_inference_session(face_path)
         except Exception as e:
             logger.error(f"Failed to initialize Face Detector ONNX session: {e}")
             
         try:
-            self._vlm_session = create_qnn_session(vlm_path)
+            self._vlm_session = create_inference_session(vlm_path)
         except Exception as e:
             logger.error(f"Failed to initialize YOLOv8 ONNX session: {e}")
 
