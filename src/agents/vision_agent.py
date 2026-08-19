@@ -324,6 +324,46 @@ def decode_yolov8_predictions(raw_outputs, orig_w, orig_h, conf_thresh=0.30, iou
 
     return final_boxes, final_confs, final_classes
 
+def create_qnn_session(model_path: str):
+    """
+    Initializes ONNX Runtime session prioritized for Qualcomm Hexagon NPU (HTP).
+    """
+    import onnxruntime as ort
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    available_providers = ort.get_available_providers()
+    logger.info(f"[VisionAgent]: Available ONNX Providers: {available_providers}")
+
+    # Standard shared library search paths for Qualcomm QNN on Ubuntu ARM64
+    qnn_backend = "libQnnHtp.so"
+
+    qnn_options = {
+        "backend_path": qnn_backend,
+        "htp_performance_mode": "burst",          # Max clock speed for lowest inference latency
+        "htp_graph_finalization_optimization_mode": "3"
+    }
+
+    if "QNNExecutionProvider" in available_providers:
+        logger.info(f"[VisionAgent]: Initializing {os.path.basename(model_path)} on Qualcomm Hexagon NPU...")
+        providers = [
+            ("QNNExecutionProvider", qnn_options),
+            "CPUExecutionProvider"
+        ]
+    else:
+        logger.warning(f"[VisionAgent]: QNNExecutionProvider unavailable. Falling back to CPU.")
+        providers = ["CPUExecutionProvider"]
+
+    session_options = ort.SessionOptions()
+    session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    session_options.intra_op_num_threads = 4
+
+    return ort.InferenceSession(
+        model_path,
+        sess_options=session_options,
+        providers=providers
+    )
+
 class VisionVLMAgent(BaseAgent):
     """
     Executes NPU-accelerated face verification and VLM tracking loops.
@@ -370,6 +410,9 @@ class VisionVLMAgent(BaseAgent):
         self.calibrated_noise_floor = -55.0
         self._active_routing_engine = "None"
         self._simulation_camera = False
+        
+        self.smooth_box = None
+        self.smooth_alpha = 0.65  # Weight for current frame (0.65 current + 0.35 history)
         
         # Subscribe to Orchestrator state changes and commands
         self.subscribe(StateChangedEvent)
@@ -465,6 +508,7 @@ class VisionVLMAgent(BaseAgent):
                 self._last_target_box = None
                 self._last_error = None
                 self.lost_target_timestamp = None
+                self.smooth_box = None
                 
             # Clear detected faces if not in verification state
             if self.current_state != SystemState.VISUAL_VERIFYING:
@@ -480,6 +524,7 @@ class VisionVLMAgent(BaseAgent):
             self.last_target_seen_time = time.time()
             self._last_target_box = None
             self._last_error = None
+            self.smooth_box = None
             self._active_routing_engine = "None"
             
         elif isinstance(event, ServoPositionEvent):
@@ -519,12 +564,10 @@ class VisionVLMAgent(BaseAgent):
             vlm_path = os.path.join(ROOT_DIR, vlm_path)
         
         use_mock = self.config.simulation_mode
-        ort_lib = None
         
         if not use_mock:
             try:
                 import onnxruntime as ort
-                ort_lib = ort
             except ImportError:
                 logger.warning("onnxruntime not found. Falling back to mock model sessions.")
                 use_mock = True
@@ -540,33 +583,16 @@ class VisionVLMAgent(BaseAgent):
             logger.info("ONNX Runtime sessions initialized in SIMULATION mode.")
             return
 
-        # Hardware mode: Initialize Face Detector using ONNX Runtime
+        # Hardware mode: Initialize using QNN Hexagon NPU Helpers
         try:
-            self._face_session = ort_lib.InferenceSession(
-                face_path,
-                providers=["QNNExecutionProvider", "CPUExecutionProvider"],
-                provider_options=[{"backend_path": "libqnn_hp.so"}, {}]
-            )
-            logger.info("Loaded Face Detector via ONNX Runtime.")
+            self._face_session = create_qnn_session(face_path)
         except Exception as e:
-            logger.warning(f"Could not load Face Detector with QNN EP: {e}. Falling back to CPU.")
-            try:
-                self._face_session = ort_lib.InferenceSession(face_path, providers=['CPUExecutionProvider'])
-            except Exception as ex:
-                logger.error(f"Fallback ONNX Runtime session creation failed: {ex}")
-                self._face_session = None
-
-        # Load YOLO-World session
+            logger.error(f"Failed to initialize Face Detector ONNX session: {e}")
+            
         try:
-            self._vlm_session = ort_lib.InferenceSession(
-                vlm_path,
-                providers=['QNNExecutionProvider'],
-                provider_options=[{'backend_path': 'libqnn_hp.so'}]
-            )
-            logger.info("Loaded YOLO-World with Qualcomm QNN Execution Provider.")
+            self._vlm_session = create_qnn_session(vlm_path)
         except Exception as e:
-            logger.warning(f"Could not load YOLO-World with QNN EP: {e}. Falling back to CPU.")
-            self._vlm_session = ort_lib.InferenceSession(vlm_path, providers=['CPUExecutionProvider'])
+            logger.error(f"Failed to initialize YOLOv8 ONNX session: {e}")
 
     def _setup_camera(self, configured_idx, width, height):
         """Attempts to open a camera, prober sequence: configured first, then 2, 4, 1, 0."""
@@ -1002,13 +1028,28 @@ class VisionVLMAgent(BaseAgent):
                     head_h = int(bh * 0.35)
                     head_x = bx + int(bw * 0.15)
                     head_y = by
-                    target_cx = head_x + head_w / 2.0
-                    target_cy = head_y + head_h / 2.0
-                    bbox = (int(head_x * scale_x), int(head_y * scale_y), int(head_w * scale_x), int(head_h * scale_y))
+                    x, y, w, h = int(head_x * scale_x), int(head_y * scale_y), int(head_w * scale_x), int(head_h * scale_y)
                 else:
-                    target_cx = bx + bw / 2.0
-                    target_cy = by + bh / 2.0
-                    bbox = (int(bx * scale_x), int(by * scale_y), int(bw * scale_x), int(bh * scale_y))
+                    x, y, w, h = int(bx * scale_x), int(by * scale_y), int(bw * scale_x), int(bh * scale_y)
+                
+                if self.smooth_box is None:
+                    self.smooth_box = np.array([x, y, w, h], dtype=np.float32)
+                else:
+                    # Check if the new detection is close to the previous track (distance < 120px)
+                    prev_center = (self.smooth_box[0] + self.smooth_box[2]/2, self.smooth_box[1] + self.smooth_box[3]/2)
+                    curr_center = (x + w/2, y + h/2)
+                    dist = np.hypot(curr_center[0] - prev_center[0], curr_center[1] - prev_center[1])
+
+                    if dist < 150: # Same object -> smooth it
+                        self.smooth_box = self.smooth_alpha * np.array([x, y, w, h], dtype=np.float32) + (1.0 - self.smooth_alpha) * self.smooth_box
+                    else:          # New target or large deliberate jump
+                        self.smooth_box = np.array([x, y, w, h], dtype=np.float32)
+
+                sx, sy, sw, sh = [int(v) for v in self.smooth_box]
+                target_cx = sx + sw / 2.0
+                target_cy = sy + sh / 2.0
+                bbox = (sx, sy, sw, sh)
+                self.current_target_bbox = bbox
                 
                 logger.info(f"[VisionAgent]: Latch confirmed on '{clean_prompt}' at {bbox} (conf: {conf:.2f})")
                 
