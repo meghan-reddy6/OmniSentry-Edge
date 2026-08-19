@@ -254,7 +254,7 @@ def compute_nms(boxes, scores, overlap_thresh=0.3):
         
     return pick
 
-def decode_yolov8_predictions(raw_outputs, orig_w, orig_h, conf_thresh=0.30, iou_thresh=0.45):
+def decode_yolov8_uint8(raw_outputs, orig_w, orig_h, conf_thresh=0.30, iou_thresh=0.45):
     # Map outputs by index or name
     raw_boxes = np.squeeze(raw_outputs[0])      # (8400, 4), uint8
     raw_scores = np.squeeze(raw_outputs[1])     # (8400,), uint8
@@ -324,9 +324,9 @@ def decode_yolov8_predictions(raw_outputs, orig_w, orig_h, conf_thresh=0.30, iou
 
     return final_boxes, final_confs, final_classes
 
-def create_inference_session(model_path: str):
+def create_qnn_session(model_path: str):
     """
-    Creates an ONNX Runtime inference session prioritizing the Qualcomm Hexagon NPU.
+    Initializes ONNX Runtime session prioritizing Qualcomm Hexagon NPU (HTP).
     """
     import onnxruntime as ort
     if not os.path.exists(model_path):
@@ -583,12 +583,12 @@ class VisionVLMAgent(BaseAgent):
 
         # Hardware mode: Initialize using QNN Hexagon NPU Helpers
         try:
-            self._face_session = create_inference_session(face_path)
+            self._face_session = create_qnn_session(face_path)
         except Exception as e:
             logger.error(f"Failed to initialize Face Detector ONNX session: {e}")
             
         try:
-            self._vlm_session = create_inference_session(vlm_path)
+            self._vlm_session = create_qnn_session(vlm_path)
         except Exception as e:
             logger.error(f"Failed to initialize YOLOv8 ONNX session: {e}")
 
@@ -999,7 +999,7 @@ class VisionVLMAgent(BaseAgent):
             conf_thresh = self.config.vision.get("confidence_threshold", threshold)
             iou_thresh = self.config.vision.get("nms_threshold", 0.45)
             
-            final_boxes, final_confs, final_classes = decode_yolov8_predictions(
+            final_boxes, final_confs, final_classes = decode_yolov8_uint8(
                 raw_outputs, width, height, conf_thresh, iou_thresh
             )
             
