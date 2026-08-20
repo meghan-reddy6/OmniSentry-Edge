@@ -326,41 +326,41 @@ def decode_yolov8_uint8(raw_outputs, orig_w, orig_h, conf_thresh=0.30, iou_thres
 
 def create_qnn_session(model_path: str):
     """
-    Initializes ONNX Runtime session prioritizing Qualcomm Hexagon NPU (HTP).
+    Instantiates an ONNX Runtime session targeting the Qualcomm Hexagon NPU (HTP).
     """
     import onnxruntime as ort
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
+        raise FileNotFoundError(f"Model path does not exist: {model_path}")
 
-    available_providers = ort.get_available_providers()
-    logger.info(f"[VisionAgent]: Available Execution Providers: {available_providers}")
+    available_eps = ort.get_available_providers()
+    logger.info(f"[VisionAgent]: Registered Execution Providers: {available_eps}")
 
-    # Prioritize Qualcomm Hexagon Tensor Processor (HTP) on Rubik Pi 3
+    # Qualcomm Hexagon Tensor Processor (HTP) Configuration
     qnn_options = {
-        "backend_path": "/usr/lib/libQnnHtp.so",
-        "htp_performance_mode": "burst",          # Maximum NPU clock frequency
+        "backend_path": "libQnnHtp.so",
+        "profiling_level": "basic",
+        "htp_performance_mode": "burst",
         "htp_graph_finalization_optimization_mode": "3"
     }
 
-    if "QNNExecutionProvider" in available_providers:
-        logger.info(f"[VisionAgent]: Offloading {os.path.basename(model_path)} to Qualcomm Hexagon NPU (QNN)...")
+    if "QNNExecutionProvider" in available_eps:
+        logger.info(f"[VisionAgent]: Routing {os.path.basename(model_path)} directly to Qualcomm Hexagon NPU...")
         providers = [
             ("QNNExecutionProvider", qnn_options),
             "CPUExecutionProvider"
         ]
     else:
-        logger.warning(f"[VisionAgent]: QNNExecutionProvider unavailable. Falling back to CPUExecutionProvider.")
+        logger.warning("[VisionAgent]: QNNExecutionProvider unavailable. Falling back to CPU.")
         providers = ["CPUExecutionProvider"]
 
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     session_options.intra_op_num_threads = 4
 
-    return ort.InferenceSession(
-        model_path,
-        sess_options=session_options,
-        providers=providers
-    )
+    session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
+    active_providers = session.get_providers()
+    logger.info(f"[VisionAgent]: Active runtime provider for {os.path.basename(model_path)}: {active_providers}")
+    return session
 
 class VisionVLMAgent(BaseAgent):
     """
