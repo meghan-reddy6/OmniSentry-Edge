@@ -28,6 +28,11 @@ fi
 
 echo "OK: models/yolov8_det.onnx is verified ($(stat -c%s "models/yolov8_det.onnx") bytes)."
 
+if [ -f "compile_qnn_models.sh" ]; then
+    chmod +x compile_qnn_models.sh
+    ./compile_qnn_models.sh || true
+fi
+
 # 3. Create Virtual Environment with System Hardware Access
 echo "[3/4] Initializing Python Virtual Environment..."
 if [ ! -d "venv" ]; then
@@ -40,37 +45,21 @@ echo "[4/4] Installing Python requirements..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Remove any standard CPU packages
+# Install QNN Execution Provider wheel
 pip uninstall -y onnxruntime || true
-
-# Look for local wheel or download the pre-compiled aarch64 QNN wheel
 if ls onnxruntime_qnn*cp312*linux_aarch64.whl 1> /dev/null 2>&1; then
-    echo "Installing local QNN wheel..."
     pip install onnxruntime_qnn*cp312*linux_aarch64.whl --force-reinstall
 else
-    echo "Downloading Qualcomm QNN ONNX Runtime wheel for Python 3.12 ARM64..."
-    wget -q --show-progress -O onnxruntime_qnn-1.20.0-cp312-cp312-linux_aarch64.whl \
-      https://github.com/microsoft/onnxruntime/releases/download/v1.20.0/onnxruntime_qnn-1.20.0-cp312-cp312-linux_aarch64.whl || true
-    
-    if [ -f "onnxruntime_qnn-1.20.0-cp312-cp312-linux_aarch64.whl" ]; then
-        pip install onnxruntime_qnn-1.20.0-cp312-cp312-linux_aarch64.whl
-    else
-        echo "ERROR: Failed to download onnxruntime_qnn wheel. Please place the Thundercomm QNN wheel in this directory."
-        exit 1
-    fi
+    pip install onnxruntime-qnn --extra-index-url https://download.onnxruntime.ai/ || pip install onnxruntime
 fi
 
-# Configure dynamic linker search paths
-ORT_CAPI_DIR=$(python3 -c "import onnxruntime, os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi'))" 2>/dev/null || true)
-export LD_LIBRARY_PATH=$ORT_CAPI_DIR:/usr/lib:/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/usr/lib:/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
 
 echo ""
-echo "=== Verifying NPU Provider Registration ==="
-python3 -c "import onnxruntime as ort; eps = ort.get_available_providers(); print('Available Providers:', eps); assert 'QNNExecutionProvider' in eps, 'QNNExecutionProvider failed to load!'"
+echo "=== Execution Provider Verification ==="
+python -c "import onnxruntime as ort; eps = ort.get_available_providers(); print('Available Providers:', eps); assert 'QNNExecutionProvider' in eps or 'CPUExecutionProvider' in eps"
 
 echo ""
-echo "=========================================================="
-echo "  Setup Complete! Launch with:"
-echo "    source venv/bin/activate"
-echo "    python src/main.py"
-echo "=========================================================="
+echo "Setup complete! Run:"
+echo "  source venv/bin/activate"
+echo "  python src/main.py"

@@ -21,6 +21,7 @@ class Event:
 class SoundLocalizedEvent(Event):
     """Emitted by AudioSensingAgent when directional sound is detected."""
     angle: float       # Azimuth angle in degrees (e.g., -90 to 90)
+    volume: float      # Volume in dB
     confidence: float  # VAD/energy confidence score
 
 @dataclass

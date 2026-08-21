@@ -102,6 +102,10 @@ class AudioSensingAgent(BaseAgent):
         self._smooth_db = -55.0
         self._speech_buffer = []
 
+        self.min_confidence = self.config.audio.get("min_confidence", 0.40)
+        self.audio_cooldown_sec = self.config.audio.get("cooldown_sec", 0.25)
+        self._last_sound_event_time = 0.0
+
         # Subscribe to simulated voice command injection
         self.subscribe(SimulateSpeechCommand)
 
@@ -690,12 +694,21 @@ class AudioSensingAgent(BaseAgent):
                         angle, confidence = estimate_doa_gcc_phat(
                             chan1, chan2, sample_rate, mic_distance, speed_of_sound
                         )
-                        if confidence > 0.01:
+                        
+                        current_time = time.time()
+                        if (confidence >= self.min_confidence and 
+                            (current_time - self._last_sound_event_time) >= self.audio_cooldown_sec):
+                            
+                            self._last_sound_event_time = current_time
                             logger.info(
-                                f"Sound detected! Smooth Vol: {self._smooth_db:.1f} dB, "
-                                f"Est. Angle: {angle:+.1f} deg, Confidence: {confidence:.3f}"
+                                f"[AudioAgent]: Valid sound localized: angle={angle:+.1f} deg, "
+                                f"vol={self._smooth_db:.1f} dB, conf={confidence:.2f}"
                             )
-                            event = SoundLocalizedEvent(angle=angle, confidence=confidence)
+                            event = SoundLocalizedEvent(
+                                angle=float(angle),
+                                volume=float(self._smooth_db),
+                                confidence=float(confidence)
+                            )
                             asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
                     else:
                         logger.debug(f"Sound detected in Mono! Smooth Vol: {self._smooth_db:.1f} dB")

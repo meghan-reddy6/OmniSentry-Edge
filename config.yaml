@@ -13,9 +13,12 @@ vision:
 audio:
   asr_model_path: "models/whisper_tiny_en_int8.onnx"
   sample_rate: 16000
-  channels: 1
+  channels: 2
   chunk_size: 1024
   vad_silence_duration: 1.5
+  vad_threshold_db: -20.0
+  min_confidence: 0.40
+  cooldown_sec: 0.25
 
 servos:
   i2c_bus: 1

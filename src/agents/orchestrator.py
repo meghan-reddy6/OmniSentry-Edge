@@ -23,6 +23,7 @@ class OrchestratorAgent(BaseAgent):
         super().__init__("Orchestrator", bus, config)
         self.state = SystemState.IDLE
         self._timer_task = None
+        self.current_prompt = None
 
         # Subscribe to relevant events
         self.subscribe(SoundLocalizedEvent)
@@ -41,10 +42,12 @@ class OrchestratorAgent(BaseAgent):
         logger.info("Orchestrator agent cleaned up.")
 
     async def handle_event(self, event: Event):
-        logger.info(f"Orchestrator received {type(event).__name__} in state {self.state.value}")
+        # Downgraded to debug to prevent log spam (e.g. from continuous AudioLevelEvent)
+        logger.debug(f"Orchestrator received {type(event).__name__} in state {self.state.value}")
 
         # Check for preemption by user command (TrackCommand)
         if isinstance(event, TrackCommand):
+            self.current_prompt = event.prompt
             await self._transition_to(SystemState.VLM_TRACKING)
             return
 
@@ -63,9 +66,12 @@ class OrchestratorAgent(BaseAgent):
         elif self.state == SystemState.ACOUSTIC_SEEK:
             if isinstance(event, MotionDoneEvent):
                 # Servo has completed rotation to the sound location
-                await self._transition_to(SystemState.VISUAL_VERIFYING)
-                await self.bus.publish(VerifyFaceCommand(timeout=self.config.vision.get("tracking_timeout", 3.0)))
-                self._start_timer()
+                if self.current_prompt and self.current_prompt.strip():
+                    logger.info(f"[Orchestrator]: Acoustic seek complete. Resuming tracking for '{self.current_prompt}'")
+                    await self._transition_to(SystemState.VLM_TRACKING)
+                else:
+                    logger.info("[Orchestrator]: Acoustic seek complete. No active prompt; returning to IDLE.")
+                    await self._transition_to(SystemState.IDLE)
 
             elif isinstance(event, SoundLocalizedEvent):
                 # Update seek target if a stronger sound signal arrives
@@ -90,10 +96,14 @@ class OrchestratorAgent(BaseAgent):
                 await self.bus.publish(MoveHomeCommand())
 
         elif self.state == SystemState.VLM_TRACKING:
-            if isinstance(event, TargetNotFoundEvent):
+            if isinstance(event, SoundLocalizedEvent):
+                # Ignore ambient sound cues while visually locked to prevent servo jerking
+                pass
+                
+            elif isinstance(event, TargetNotFoundEvent):
                 # Target lost in visual tracking loop
-                logger.warning("Visual tracking target lost. Resetting...")
-                await self._transition_to(SystemState.RESETTING)
+                logger.warning("Visual tracking target lost. Returning home and waiting in IDLE...")
+                await self._transition_to(SystemState.IDLE)
                 await self.bus.publish(MoveHomeCommand())
 
         elif self.state == SystemState.RESETTING:

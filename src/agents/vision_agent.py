@@ -324,43 +324,37 @@ def decode_yolov8_uint8(raw_outputs, orig_w, orig_h, conf_thresh=0.30, iou_thres
 
     return final_boxes, final_confs, final_classes
 
-def create_qnn_session(model_path: str):
+def create_qnn_context_session(model_name: str) -> ort.InferenceSession:
     """
-    Instantiates an ONNX Runtime session targeting the Qualcomm Hexagon NPU (HTP).
+    Initializes QNN session, prioritizing pre-compiled HTP context binaries.
     """
-    import onnxruntime as ort
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model path does not exist: {model_path}")
+    ctx_bin_path = os.path.join("models", "qnn_ctx", f"{model_name}.serialized.bin")
+    base_onnx_path = os.path.join("models", f"{model_name}.onnx")
 
-    available_eps = ort.get_available_providers()
-    logger.info(f"[VisionAgent]: Registered Execution Providers: {available_eps}")
-
-    # Qualcomm Hexagon Tensor Processor (HTP) Configuration
     qnn_options = {
-        "backend_path": "libQnnHtp.so",
-        "profiling_level": "basic",
+        "backend_path": "/usr/lib/libQnnHtp.so",
         "htp_performance_mode": "burst",
         "htp_graph_finalization_optimization_mode": "3"
     }
 
-    if "QNNExecutionProvider" in available_eps:
-        logger.info(f"[VisionAgent]: Routing {os.path.basename(model_path)} directly to Qualcomm Hexagon NPU...")
-        providers = [
-            ("QNNExecutionProvider", qnn_options),
-            "CPUExecutionProvider"
-        ]
-    else:
-        logger.warning("[VisionAgent]: QNNExecutionProvider unavailable. Falling back to CPU.")
-        providers = ["CPUExecutionProvider"]
-
+    # If serialized context binary exists, pass ep.context_file_path for instant NPU load
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    session_options.intra_op_num_threads = 4
+    session_options.intra_op_num_threads = 2
+    session_options.inter_op_num_threads = 1
+    session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
-    session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
-    active_providers = session.get_providers()
-    logger.info(f"[VisionAgent]: Active runtime provider for {os.path.basename(model_path)}: {active_providers}")
-    return session
+    target_path = base_onnx_path
+    if os.path.exists(ctx_bin_path):
+        logger.info(f"[VisionAgent]: Loading pre-compiled QNN context binary: {ctx_bin_path}")
+        session_options.add_session_config_entry("ep.context_file_path", ctx_bin_path)
+
+    providers = [
+        ("QNNExecutionProvider", qnn_options),
+        "CPUExecutionProvider"
+    ]
+
+    return ort.InferenceSession(target_path, sess_options=session_options, providers=providers)
 
 class VisionVLMAgent(BaseAgent):
     """
@@ -371,12 +365,16 @@ class VisionVLMAgent(BaseAgent):
         super().__init__("VisionVLM", bus, config)
         self._running_vision = False
         self._thread = None
+        self._inference_thread = None
         self.event_loop = None
+        
+        self._inference_frame = None
+        self._inference_lock = threading.Lock()
         
         # State and tracking control variables
         self.current_state = SystemState.IDLE
         self.tracking_active = False
-        self.tracking_prompt = None
+        self.current_prompt = None
         self.last_target_seen_time = None
         
         # ONNX sessions
@@ -468,6 +466,10 @@ class VisionVLMAgent(BaseAgent):
         self._running_vision = True
         self._thread = threading.Thread(target=self._run_vision_pipeline, daemon=True)
         self._thread.start()
+        
+        # Start async inference worker thread
+        self._inference_thread = threading.Thread(target=self._async_inference_worker, daemon=True)
+        self._inference_thread.start()
 
     async def cleanup(self):
         logger.info("Stopping VisionVLMAgent video pipeline...")
@@ -475,7 +477,9 @@ class VisionVLMAgent(BaseAgent):
         if self._thread:
             self._thread.join(timeout=1.0)
             self._thread = None
-            
+        if self._inference_thread:
+            self._inference_thread.join(timeout=1.0)
+            self._inference_thread = None
         if self._web_server:
             logger.info("Shutting down diagnostics web server...")
             self._web_server.shutdown()
@@ -502,7 +506,8 @@ class VisionVLMAgent(BaseAgent):
             # Reset tracking if state changes away from tracking
             if self.current_state != SystemState.VLM_TRACKING:
                 self.tracking_active = False
-                self.tracking_prompt = None
+                self.current_prompt = None
+                self.current_target_bbox = None
                 self._last_target_box = None
                 self._last_error = None
                 self.lost_target_timestamp = None
@@ -513,11 +518,15 @@ class VisionVLMAgent(BaseAgent):
                 self._current_detected_faces = []
                 
         elif isinstance(event, VerifyFaceCommand):
+            # Only run face verification if explicitly requested by a user command:
+            if not self.current_prompt or self.current_prompt.lower() not in ["face", "person", "head"]:
+                logger.info("[VisionAgent]: Ignoring unsolicited face verification request.")
+                return
             logger.info("Received command to verify face.")
             
         elif isinstance(event, TrackCommand):
             logger.info(f"Received command to track object: '{event.prompt}'")
-            self.tracking_prompt = event.prompt
+            self.current_prompt = event.prompt
             self.tracking_active = True
             self.last_target_seen_time = time.time()
             self._last_target_box = None
@@ -583,12 +592,12 @@ class VisionVLMAgent(BaseAgent):
 
         # Hardware mode: Initialize using QNN Hexagon NPU Helpers
         try:
-            self._face_session = create_qnn_session(face_path)
+            self._face_session = create_qnn_context_session("face_detector")
         except Exception as e:
             logger.error(f"Failed to initialize Face Detector ONNX session: {e}")
             
         try:
-            self._vlm_session = create_qnn_session(vlm_path)
+            self._vlm_session = create_qnn_context_session("yolov8_det")
         except Exception as e:
             logger.error(f"Failed to initialize YOLOv8 ONNX session: {e}")
 
@@ -673,16 +682,18 @@ class VisionVLMAgent(BaseAgent):
                     time.sleep(0.01)
                     continue
 
-            # Core processing is state-dependent
-            if self.current_state == SystemState.VISUAL_VERIFYING:
-                self._process_face_verification(frame, width, height, verify_threshold)
-            elif self.current_state == SystemState.VLM_TRACKING:
-                self._process_object_tracking(frame, width, height)
-            else:
+            if frame is not None and not self._simulation_camera:
+                frame = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_NEAREST)
+                width, height = 640, 640
+
+            if frame is not None:
+                with self._inference_lock:
+                    self._inference_frame = frame.copy()
+
+            # Note: Core processing is now handled by _async_inference_worker
+            if self.current_state not in [SystemState.VISUAL_VERIFYING, SystemState.VLM_TRACKING]:
                 self._last_target_box = None
                 self._last_error = None
-                # Slow frame capture down during idle states to reduce CPU load
-                time.sleep(0.02)
 
             # Calculate FPS using rolling average
             now = time.time()
@@ -720,6 +731,28 @@ class VisionVLMAgent(BaseAgent):
         # Cleanup OpenCV resources
         cap.release()
         logger.info("Video capture released.")
+
+    def _async_inference_worker(self):
+        """Dedicated background worker that runs NPU inference without stalling video capture."""
+        vision_cfg = self.config.vision
+        verify_threshold = vision_cfg.get("verify_threshold", 0.5)
+        
+        while self._running_vision:
+            frame = None
+            with getattr(self, "_inference_lock", threading.Lock()):
+                if getattr(self, "_inference_frame", None) is not None:
+                    frame = self._inference_frame
+                    
+            if frame is None:
+                time.sleep(0.01)
+                continue
+                
+            if self.current_state == SystemState.VISUAL_VERIFYING:
+                self._process_face_verification(frame, 640, 640, verify_threshold)
+            elif self.current_state == SystemState.VLM_TRACKING:
+                self._process_object_tracking(frame, 640, 640)
+            else:
+                time.sleep(0.02)
 
     def draw_hud_overlay(self, frame, state, target_box, error_coords, fps):
         """Draws visual HUD graphics (crosshair, target box, error vector, status text) on the frame."""
@@ -952,13 +985,16 @@ class VisionVLMAgent(BaseAgent):
 
     def _run_grounding(self, frame, width, height, threshold=0.30):
         """Runs the primary YOLOv8 ONNX detector to locate the target prompt."""
-        prompt = self.tracking_prompt.strip().lower().rstrip("\\/\"'") if self.tracking_prompt else ""
+        # Guard clause at the very top of grounding / detection:
+        if not self.current_prompt or not self.current_prompt.strip():
+            self.current_target_bbox = None
+            return None
+            
+        prompt = self.current_prompt.strip().lower().rstrip("\\/\"'")
         clean_prompt = prompt
         
-        FACE_KEYWORDS = {"face", "head", "human face", "my face", "person face", "eyes"}
-        PERSON_KEYWORDS = {"person", "human", "man", "woman", "guy", "girl", "body", "people"}
-        
-        if clean_prompt in FACE_KEYWORDS or clean_prompt in PERSON_KEYWORDS:
+        # Only search for face/head if the user actually commanded it
+        if clean_prompt in ["face", "head", "person", "human face", "my face", "person face", "eyes", "human", "man", "woman", "guy", "girl", "body", "people"]:
             grounding_prompt = "person"
         else:
             grounding_prompt = clean_prompt
@@ -1021,7 +1057,7 @@ class VisionVLMAgent(BaseAgent):
                 scale_x = width / 640.0
                 scale_y = height / 640.0
                 
-                if clean_prompt in FACE_KEYWORDS and cls_name == "person":
+                if clean_prompt in ["face", "head", "person", "human face", "my face", "person face", "eyes", "human", "man", "woman", "guy", "girl", "body", "people"] and cls_name == "person":
                     head_w = int(bw * 0.70)
                     head_h = int(bh * 0.35)
                     head_x = bx + int(bw * 0.15)
@@ -1057,6 +1093,10 @@ class VisionVLMAgent(BaseAgent):
                 import asyncio
                 event = TrackingErrorEvent(dx=dx, dy=dy)
                 asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
+            else:
+                logger.info(f"[VisionAgent]: Target '{self.current_prompt}' not visible. Waiting...")
+                self.current_target_bbox = None
+                self.smooth_box = None
                     
         return bbox
 
