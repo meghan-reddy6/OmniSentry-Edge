@@ -5,46 +5,44 @@ import threading
 import cv2
 import numpy as np
 import onnxruntime as ort
+from src.common.bus import BaseAgent, EventBus
 
 logger = logging.getLogger(__name__)
 
-def create_qnn_session(model_path: str) -> ort.InferenceSession:
-    """
-    Creates an ONNX Runtime session targeting the Qualcomm Hexagon NPU (HTP)
-    using the official Rubik Pi 3 provider configuration.
-    """
+def create_qnn_session(npu_cfg: dict) -> ort.InferenceSession:
+    model_path = npu_cfg.get("model_path", "models/yolov8_det.onnx")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
     available_eps = ort.get_available_providers()
-    logger.info(f"[VisionAgent]: Available Execution Providers: {available_eps}")
+    logger.info(f"[VisionAgent]: Registered Execution Providers: {available_eps}")
 
-    # Official Rubik Pi 3 QNN Provider options (profiling set to 'off' to prevent CSV path error)
-    providers = [
-        ("QNNExecutionProvider", {
-            "backend_type": "htp",
-            "htp_performance_mode": "burst",
-            "htp_graph_finalization_optimization_mode": "3",
-            "profiling_level": "off",
-        }),
-        "CPUExecutionProvider"
-    ]
+    qnn_options = {
+        "backend_type": npu_cfg.get("backend_type", "htp"),
+        "htp_performance_mode": npu_cfg.get("performance_mode", "burst"),
+        "htp_graph_finalization_optimization_mode": "3",
+        "profiling_level": npu_cfg.get("profiling_level", "off"),
+    }
+
+    if "QNNExecutionProvider" in available_eps:
+        logger.info(f"[VisionAgent]: Routing {os.path.basename(model_path)} to Qualcomm Hexagon NPU (HTP)...")
+        providers = [("QNNExecutionProvider", qnn_options), "CPUExecutionProvider"]
+    else:
+        logger.warning(f"[VisionAgent]: QNN unavailable for {os.path.basename(model_path)}. Falling back to CPU.")
+        providers = ["CPUExecutionProvider"]
 
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    session_options.intra_op_num_threads = 2
-    session_options.inter_op_num_threads = 1
+    session_options.intra_op_num_threads = npu_cfg.get("intra_op_threads", 2)
+    session_options.inter_op_num_threads = npu_cfg.get("inter_op_threads", 1)
     session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
     session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
-    active_eps = session.get_providers()
-    logger.info(f"[VisionAgent]: Active providers for {os.path.basename(model_path)}: {active_eps}")
-
+    logger.info(f"[VisionAgent]: Active providers for {os.path.basename(model_path)}: {session.get_providers()}")
     return session
 
 
-def decode_yolov8_uint8(outputs, orig_w, orig_h, conf_thresh=0.35):
-    """Decodes raw YOLO tensor outputs into bounding boxes, confidences, and class IDs."""
+def decode_yolov8_uint8(outputs, orig_w, orig_h, conf_thresh=0.35, nms_thresh=0.45):
     raw = outputs[0]
     if raw.ndim == 3 and raw.shape[1] < raw.shape[2]:
         raw = np.transpose(raw, (0, 2, 1))
@@ -67,7 +65,7 @@ def decode_yolov8_uint8(outputs, orig_w, orig_h, conf_thresh=0.35):
             confidences.append(conf)
             class_ids.append(class_id)
 
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_thresh, 0.45)
+    indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_thresh, nms_thresh)
     final_boxes, final_confs, final_classes = [], [], []
     if len(indices) > 0:
         for i in np.array(indices).flatten():
@@ -78,20 +76,38 @@ def decode_yolov8_uint8(outputs, orig_w, orig_h, conf_thresh=0.35):
     return final_boxes, final_confs, final_classes
 
 
-class VisionVLMAgent:
-    def __init__(self, bus, config):
+class VisionVLMAgent(BaseAgent):
+    def __init__(self, bus: EventBus, config):
+        super().__init__("VisionVLM", bus, config)
         self.bus = bus
         self.config = config
-        self.current_prompt = None
+        
+        # Read vision configs
+        vision_cfg = self.config.get("vision", {})
+        cam_cfg = vision_cfg.get("camera", {})
+        npu_cfg = vision_cfg.get("npu", {})
+        trk_cfg = vision_cfg.get("tracking", {})
+
+        self.camera_index = cam_cfg.get("index", 0)
+        self.frame_width = cam_cfg.get("width", 640)
+        self.frame_height = cam_cfg.get("height", 480)
+        self.target_fps = cam_cfg.get("fps", 30)
+        self.flip_h = cam_cfg.get("flip_horizontal", False)
+        self.flip_v = cam_cfg.get("flip_vertical", False)
+
+        self.conf_threshold = trk_cfg.get("conf_threshold", 0.35)
+        self.nms_threshold = trk_cfg.get("nms_iou_threshold", 0.45)
+        self.smooth_alpha = trk_cfg.get("ema_alpha", 0.65)
+        self.infer_throttle_sec = 1.0 / trk_cfg.get("inference_fps_limit", 22)
+
+        self.current_prompt = self.config.get("orchestrator", {}).get("default_prompt", None)
         self.current_target_bbox = None
         self.smooth_box = None
-        self.smooth_alpha = 0.65
 
-        # Initialize NPU inference session
-        model_path = self.config.get("vision", {}).get("model_path", "models/yolov8_det.onnx")
-        self._session = create_qnn_session(model_path)
+        # NPU Engine Session
+        self._session = create_qnn_session(npu_cfg)
 
-        # Thread Decoupling: Video loop runs at 30 FPS, NPU runs in dedicated background thread
+        # Thread decoupling
         self._latest_raw_frame = None
         self._frame_lock = threading.Lock()
         self._latest_detections = []
@@ -100,7 +116,6 @@ class VisionVLMAgent:
         self._infer_thread.start()
 
     def _async_npu_worker(self):
-        """Dedicated background NPU worker thread."""
         while self._infer_running:
             frame = None
             with self._frame_lock:
@@ -122,23 +137,29 @@ class VisionVLMAgent:
                 input_name = self._session.get_inputs()[0].name
                 raw_outputs = self._session.run(None, {input_name: blob})
 
-                boxes, confs, classes = decode_yolov8_uint8(raw_outputs, w, h, conf_thresh=0.35)
+                boxes, confs, classes = decode_yolov8_uint8(
+                    raw_outputs, w, h, 
+                    conf_thresh=self.conf_threshold, 
+                    nms_thresh=self.nms_threshold
+                )
                 self._latest_detections = [(b, c, cid) for b, c, cid in zip(boxes, confs, classes)]
             except Exception as e:
                 logger.error(f"[VisionAgent]: NPU inference error: {e}")
                 time.sleep(0.05)
 
-            # Cap NPU execution rate to ~20-25 inferences/sec to minimize CPU overhead
-            time.sleep(0.03)
+            time.sleep(self.infer_throttle_sec)
 
     def process_frame(self, frame):
-        """Processes incoming camera frame, applies EMA bounding box smoothing, and draws overlay."""
-        h, w = frame.shape[:2]
+        if self.flip_h and self.flip_v:
+            frame = cv2.flip(frame, -1)
+        elif self.flip_h:
+            frame = cv2.flip(frame, 1)
+        elif self.flip_v:
+            frame = cv2.flip(frame, 0)
 
         with self._frame_lock:
             self._latest_raw_frame = frame
 
-        # Guard: If no active user prompt, do not track or draw phantom bounding boxes
         if not self.current_prompt or not self.current_prompt.strip():
             self.current_target_bbox = None
             self.smooth_box = None
@@ -161,7 +182,6 @@ class VisionVLMAgent:
             sx, sy, sw, sh = [int(v) for v in self.smooth_box]
             self.current_target_bbox = (sx, sy, sw, sh)
 
-            # Draw visual tracking crosshairs and bounding box
             cv2.rectangle(frame, (sx, sy), (sx + sw, sy + sh), (0, 255, 0), 2)
             label = f"{self.current_prompt}: {highest_conf:.2f}"
             cv2.putText(frame, label, (sx, max(20, sy - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -169,11 +189,18 @@ class VisionVLMAgent:
         return frame
 
     def set_track_prompt(self, prompt: str):
-        """Sets tracking prompt and clears previous smoothing state."""
         self.current_prompt = prompt.strip() if prompt else None
         self.current_target_bbox = None
         self.smooth_box = None
         logger.info(f"[VisionAgent]: Target prompt set to: '{self.current_prompt}'")
 
-    def stop(self):
+    async def start(self):
+        logger.info("[VisionAgent]: VisionVLMAgent started.")
+        return True
+
+    async def stop(self):
+        logger.info("[VisionAgent]: Stopping VisionVLMAgent...")
         self._infer_running = False
+        if hasattr(self, '_infer_thread') and self._infer_thread.is_alive():
+            self._infer_thread.join(timeout=1.0)
+        logger.info("[VisionAgent]: VisionVLMAgent stopped cleanly.")

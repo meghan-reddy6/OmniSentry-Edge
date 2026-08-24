@@ -102,8 +102,18 @@ class AudioSensingAgent(BaseAgent):
         self._smooth_db = -55.0
         self._speech_buffer = []
 
-        self.min_confidence = self.config.audio.get("min_confidence", 0.45)
-        self.audio_cooldown_sec = self.config.audio.get("cooldown_sec", 0.25)
+        aud_cfg = self.config.get("audio", {}) if hasattr(self.config, "get") else getattr(self.config, "audio", {})
+        if not isinstance(aud_cfg, dict):
+            aud_cfg = aud_cfg if type(aud_cfg) == dict else aud_cfg.__dict__
+            
+        self.target_device_index = aud_cfg.get("device_index", None)
+        self.sample_rate = aud_cfg.get("sample_rate", 16000)
+        self.channels = aud_cfg.get("channels", 2)
+        self.chunk_size = aud_cfg.get("chunk_size", 1024)
+        self.mic_distance = aud_cfg.get("mic_distance_meters", 0.065)
+        self.vad_threshold = aud_cfg.get("vad_threshold_db", -20.0)
+        self.min_confidence = aud_cfg.get("min_confidence", 0.45)
+        self.cooldown_sec = aud_cfg.get("cooldown_sec", 0.25)
         self._last_sound_event_time = 0.0
 
         # Subscribe to simulated voice command injection
@@ -696,19 +706,19 @@ class AudioSensingAgent(BaseAgent):
                         )
                         
                         current_time = time.time()
-                        # Only publish if sound exceeds VAD threshold, passes confidence filter, and cooldown window expired
-                        if (self._smooth_db > self.dynamic_vad_threshold and 
+                        if (self._smooth_db > self.vad_threshold and 
                             confidence >= self.min_confidence and 
-                            (current_time - self._last_sound_event_time) >= self.audio_cooldown_sec):
+                            (current_time - self._last_sound_event_time) >= self.cooldown_sec):
                             
                             self._last_sound_event_time = current_time
                             logger.info(f"[AudioAgent]: Valid sound localized: angle={angle:+.1f} deg, vol={self._smooth_db:.1f} dB, conf={confidence:.2f}")
-                            event = SoundLocalizedEvent(
-                                angle=float(angle),
-                                volume=float(self._smooth_db),
-                                confidence=float(confidence)
-                            )
-                            asyncio.run_coroutine_threadsafe(self.bus.publish(event), self.event_loop)
+                            asyncio.run_coroutine_threadsafe(self.bus.publish(
+                                SoundLocalizedEvent(
+                                    angle=float(angle),
+                                    volume=float(self._smooth_db),
+                                    confidence=float(confidence)
+                                )
+                            ), self.event_loop)
                     else:
                         logger.debug(f"Sound detected in Mono! Smooth Vol: {self._smooth_db:.1f} dB")
                 else:

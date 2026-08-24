@@ -67,10 +67,10 @@ class OrchestratorAgent(BaseAgent):
             if isinstance(event, MotionDoneEvent):
                 # Servo has completed rotation to the sound location
                 if self.current_prompt and self.current_prompt.strip():
-                    logger.info(f"[Orchestrator]: Acoustic seek complete. Resuming tracking for '{self.current_prompt}'")
+                    logger.info(f"[Orchestrator]: Resuming tracking for '{self.current_prompt}' at new acoustic angle.")
                     await self._transition_to(SystemState.VLM_TRACKING)
                 else:
-                    logger.info("[Orchestrator]: Acoustic seek complete. No active prompt; returning to IDLE.")
+                    logger.info("[Orchestrator]: Acoustic re-orientation complete. Returning to IDLE.")
                     await self._transition_to(SystemState.IDLE)
 
             elif isinstance(event, SoundLocalizedEvent):
