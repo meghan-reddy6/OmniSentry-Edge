@@ -64,17 +64,17 @@ async def cli_input_loop(bus: EventBus, shutdown_event: asyncio.Event):
                     continue
                 prompt = parts[1].strip()
                 logger.info(f"CLI: Launching TrackCommand for prompt: '{prompt}'")
-                await bus.publish(TrackCommand(prompt=prompt))
+                bus.publish(TrackCommand(prompt=prompt))
             elif cmd == "home":
                 logger.info("CLI: Command returning servos to center position.")
-                await bus.publish(MoveHomeCommand())
+                bus.publish(MoveHomeCommand())
             elif cmd == "say":
                 if len(parts) < 2 or not parts[1].strip():
                     print("Error: Missing text for simulated speech (e.g. 'say sentry')")
                     continue
                 phrase = parts[1].strip()
                 logger.info(f"CLI: Injecting simulated speech transcript: '{phrase}'")
-                await bus.publish(SimulateSpeechCommand(text=phrase))
+                bus.publish(SimulateSpeechCommand(text=phrase))
             else:
                 print(f"Unknown command: '{cmd}'. Commands: 'track <prompt>', 'home', 'say <phrase>', 'exit'")
         except asyncio.CancelledError:
@@ -91,6 +91,7 @@ async def main_async(config_path: str):
     
     # Create the central asynchronous event bus
     bus = EventBus()
+    bus.set_loop(asyncio.get_running_loop())
     
     # Create an event to coordinate clean shutdown
     shutdown_event = asyncio.Event()
@@ -131,10 +132,12 @@ async def main_async(config_path: str):
         # Shut down agents in reverse order
         logger.info("Stopping agents...")
         for agent in reversed(agents):
+            agent_name = getattr(agent, "name", agent.__class__.__name__)
+            logger.info(f"Stopping agent {agent_name}...")
             try:
                 await agent.stop()
             except Exception as e:
-                logger.error(f"Error stopping agent {agent.name}: {e}")
+                logger.error(f"Error stopping agent {agent_name}: {e}")
         logger.info("System shutdown complete.")
 
 def main():
