@@ -1,27 +1,15 @@
-system:
-  mode: "HARDWARE_ACCELERATED"
-  log_level: "INFO"
-
-vision:
-  detector_model_path: "models/yolov8_det.onnx"
-  face_model_path: "models/face_detector.onnx"
-  camera_index: 0
-  confidence_threshold: 0.35
-  nms_threshold: 0.45
-  target_fps: 30
-
 audio:
-  asr_model_path: "models/whisper_tiny_en_int8.onnx"
   sample_rate: 16000
   channels: 2
-  chunk_size: 1024
-  vad_silence_duration: 1.5
   vad_threshold_db: -20.0
-  min_confidence: 0.40
+  min_confidence: 0.45
   cooldown_sec: 0.25
 
-servos:
-  i2c_bus: 1
-  pca9685_address: 0x40
-  pan_channel: 0
-  tilt_channel: 1
+vision:
+  model_path: "models/yolov8_det.onnx"
+  conf_threshold: 0.35
+  ema_alpha: 0.65
+
+orchestrator:
+  auto_track_speaker: false
+  default_prompt: null

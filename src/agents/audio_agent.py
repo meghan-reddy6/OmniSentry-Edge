@@ -102,7 +102,7 @@ class AudioSensingAgent(BaseAgent):
         self._smooth_db = -55.0
         self._speech_buffer = []
 
-        self.min_confidence = self.config.audio.get("min_confidence", 0.40)
+        self.min_confidence = self.config.audio.get("min_confidence", 0.45)
         self.audio_cooldown_sec = self.config.audio.get("cooldown_sec", 0.25)
         self._last_sound_event_time = 0.0
 
@@ -696,14 +696,13 @@ class AudioSensingAgent(BaseAgent):
                         )
                         
                         current_time = time.time()
-                        if (confidence >= self.min_confidence and 
+                        # Only publish if sound exceeds VAD threshold, passes confidence filter, and cooldown window expired
+                        if (self._smooth_db > self.dynamic_vad_threshold and 
+                            confidence >= self.min_confidence and 
                             (current_time - self._last_sound_event_time) >= self.audio_cooldown_sec):
                             
                             self._last_sound_event_time = current_time
-                            logger.info(
-                                f"[AudioAgent]: Valid sound localized: angle={angle:+.1f} deg, "
-                                f"vol={self._smooth_db:.1f} dB, conf={confidence:.2f}"
-                            )
+                            logger.info(f"[AudioAgent]: Valid sound localized: angle={angle:+.1f} deg, vol={self._smooth_db:.1f} dB, conf={confidence:.2f}")
                             event = SoundLocalizedEvent(
                                 angle=float(angle),
                                 volume=float(self._smooth_db),
