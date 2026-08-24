@@ -1,3 +1,10 @@
+"""
+Servo Actuator Agent Module
+
+Manages physical 2-DOF Pan/Tilt gimbal actuation over the I2C bus using the PCA9685 driver.
+Integrates clamping and mechanical limit translation. Evaluates MoveServoCommand events 
+broadcasted from the visual-PID loop or acoustic TDoA angle approximations.
+"""
 import time
 import logging
 from src.common.bus import Event
@@ -10,6 +17,13 @@ class ServoTargetReachedEvent(Event):
         self.tilt = tilt
 
 class ServoActuatorAgent:
+    """
+    ServoActuatorAgent:
+    - Maintains the kinematic state machine of the robot's physical head (pan, tilt).
+    - Interfaces with Adafruit Blinka via SMBus/I2C.
+    - Gracefully falls back to simulation mode if executed off-target (e.g. PC/Windows).
+    - Broadcasts ServoTargetReachedEvent to keep the UI telemetry in lockstep.
+    """
     def __init__(self, bus, config):
         self.bus = bus
         self.config = config

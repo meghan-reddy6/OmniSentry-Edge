@@ -1,3 +1,10 @@
+"""
+Multimodal Orchestrator Agent Module
+
+Functions as the primary State Machine Engine for the OmniSentry-Edge stack. 
+Arbitrates control authority between acoustic sound-seeking mode and high-level 
+VLM target tracking via the async event bus.
+"""
 import logging
 from enum import Enum, auto
 from src.common.bus import Event
@@ -23,6 +30,12 @@ class MoveServoCommand(Event):
         self.tilt = tilt
 
 class OrchestratorAgent:
+    """
+    OrchestratorAgent:
+    - Maintains the Global FSM: IDLE <-> ACOUSTIC_SEEK <-> VLM_TRACKING.
+    - Prevents chaotic servo contention by prioritizing mode state changes.
+    - Maps high-level natural language tracking commands to internal states.
+    """
     def __init__(self, bus, config):
         self.bus = bus
         self.config = config

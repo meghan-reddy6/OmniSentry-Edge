@@ -1,3 +1,11 @@
+"""
+Audio Sensing Agent Module
+
+Executes Phase-Delay Acoustic Direction-of-Arrival (TDoA / GCC-PHAT) localization
+using a stereo microphone array via PyAudio. Dynamically filters out ambient noise 
+using a calibrated Voice Activity Detection (VAD) threshold and computes the azimuth angle 
+for acoustic seeking.
+"""
 import time
 import math
 import logging
@@ -20,6 +28,13 @@ class AudioTelemetryEvent(Event):
         self.noise_floor = noise_floor
 
 class AudioSensingAgent:
+    """
+    AudioSensingAgent:
+    - Captures stereo audio frames asynchronously at 16kHz via V4L2/ALSA PyAudio.
+    - Continuously computes environmental RMS dB and dynamically gates processing (VAD).
+    - Utilizes GCC-PHAT to extract inter-channel phase shifts and convert to spatial angle (θ).
+    - Emits SoundLocalizedEvent and AudioTelemetryEvent over the async event bus.
+    """
     def __init__(self, bus, config):
         self.bus = bus
         self.config = config

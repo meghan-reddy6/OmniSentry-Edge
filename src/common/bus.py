@@ -1,3 +1,9 @@
+"""
+Thread-Safe Async Event Bus Module
+
+Facilitates completely decoupled, non-blocking inter-process communication 
+between the async orchestrator and the multi-threaded agent worker loops.
+"""
 import asyncio
 import inspect
 import logging

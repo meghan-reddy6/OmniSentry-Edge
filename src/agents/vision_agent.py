@@ -1,3 +1,11 @@
+"""
+Vision VLM Agent Module
+
+Manages the core real-time visual tracking loop by dispatching hardware-accelerated INT8 
+ONNX inferences to the Qualcomm Hexagon NPU. Processes async V4L2 video buffer ingestion, 
+filters bounding boxes via EMA, computes spatial target error deadbands, and broadcasts 
+MoveServoCommands. Additionally hosts a threaded MJPEG diagnostic web server.
+"""
 import os
 import time
 import logging
@@ -196,6 +204,13 @@ def decode_detections(outputs, orig_w, orig_h, conf_thresh=0.35, nms_thresh=0.45
 
 
 class VisionVLMAgent:
+    """
+    VisionVLMAgent:
+    - Dedicated V4L2 ingestion thread bypassing kernel blocking.
+    - Decoupled QNN Execution Provider thread running INT8 tensor models on the DSP.
+    - Resolves UI and PID servo loop closures via EventBus subscriptions.
+    - Projects 640x640 detection coordinates back into orig camera bounds.
+    """
     def __init__(self, bus, config):
         self.bus = bus
         self.config = config
