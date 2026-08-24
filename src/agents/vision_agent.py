@@ -6,8 +6,67 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from src.common.bus import BaseAgent, EventBus
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
 logger = logging.getLogger(__name__)
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+class MJPEGStreamHandler(BaseHTTPRequestHandler):
+    agent = None
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            html = """
+            <html>
+                <head><title>OmniSentry-Edge</title></head>
+                <body style="background: black; color: white; text-align: center; font-family: sans-serif;">
+                    <h2>OmniSentry-Edge Diagnostics</h2>
+                    <img src="/stream" style="max-width: 100%; border: 2px solid #333;" alt="Camera Stream (Waiting for frames...)" />
+                </body>
+            </html>
+            """
+            self.wfile.write(html.encode('utf-8'))
+            
+        elif self.path == '/stream':
+            self.send_response(200)
+            self.send_header('Age', 0)
+            self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+            self.end_headers()
+            try:
+                while True:
+                    frame = self.agent.get_diagnostic_frame()
+                    if frame is None:
+                        # Create a black placeholder frame if camera is missing
+                        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                        import cv2
+                        cv2.putText(frame, "Waiting for Camera...", (180, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                        
+                    ret, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+                    if ret:
+                        b = jpeg.tobytes()
+                        self.wfile.write(b'--FRAME\r\n')
+                        self.send_header('Content-Type', 'image/jpeg')
+                        self.send_header('Content-Length', str(len(b)))
+                        self.end_headers()
+                        self.wfile.write(b)
+                        self.wfile.write(b'\r\n')
+                    time.sleep(0.033)
+            except Exception:
+                pass
+        else:
+            self.send_response(404)
+            self.end_headers()
 
 def create_qnn_session(npu_cfg: dict) -> ort.InferenceSession:
     """
@@ -120,6 +179,7 @@ class VisionVLMAgent(BaseAgent):
 
         # Thread decoupling
         self._latest_raw_frame = None
+        self._latest_processed_frame = None
         self._frame_lock = threading.Lock()
         self._latest_detections = []
         
@@ -184,11 +244,14 @@ class VisionVLMAgent(BaseAgent):
             frame = cv2.flip(frame, 0)
 
         with self._frame_lock:
-            self._latest_raw_frame = frame
+            # Buffer pristine frame for NPU to avoid drawing bounding boxes on input tensors
+            self._latest_raw_frame = frame.copy()
 
         if not self.current_prompt or not self.current_prompt.strip():
             self.current_target_bbox = None
             self.smooth_box = None
+            with self._frame_lock:
+                self._latest_processed_frame = frame
             return frame
 
         matched_box = None
@@ -212,6 +275,9 @@ class VisionVLMAgent(BaseAgent):
             label = f"{self.current_prompt}: {highest_conf:.2f}"
             cv2.putText(frame, label, (sx, max(20, sy - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
+        with self._frame_lock:
+            self._latest_processed_frame = frame
+
         return frame
 
     def set_track_prompt(self, prompt: str):
@@ -225,12 +291,22 @@ class VisionVLMAgent(BaseAgent):
         self._camera_running = True
         self._camera_thread = threading.Thread(target=self._async_camera_worker, daemon=True)
         self._camera_thread.start()
+        
+        sys_cfg = self.config.get("system", {}) if hasattr(self.config, "get") else getattr(self.config, "system", {})
+        if isinstance(sys_cfg, dict) and sys_cfg.get("enable_diagnostics_stream", False):
+            self._start_stream_server(sys_cfg.get("diagnostics_host", "0.0.0.0"), sys_cfg.get("diagnostics_port", 8080))
+            
         return True
 
     async def stop(self):
         logger.info("[VisionAgent]: Stopping VisionVLMAgent...")
         self._infer_running = False
         self._camera_running = False
+        
+        if hasattr(self, '_stream_server') and self._stream_server:
+            self._stream_server.shutdown()
+            self._stream_server.server_close()
+            
         if hasattr(self, '_infer_thread') and self._infer_thread.is_alive():
             self._infer_thread.join(timeout=1.0)
         if hasattr(self, '_camera_thread') and self._camera_thread and self._camera_thread.is_alive():
@@ -275,3 +351,19 @@ class VisionVLMAgent(BaseAgent):
 
         cap.release()
         logger.info("[VisionAgent]: Camera hardware released.")
+
+    def _start_stream_server(self, host, port):
+        try:
+            MJPEGStreamHandler.agent = self
+            self._stream_server = ThreadedHTTPServer((host, port), MJPEGStreamHandler)
+            self._stream_thread = threading.Thread(target=self._stream_server.serve_forever, daemon=True)
+            self._stream_thread.start()
+            logger.info(f"[VisionAgent]: Diagnostics MJPEG stream running at http://{host}:{port}/stream")
+        except Exception as e:
+            logger.error(f"[VisionAgent]: Failed to start stream server: {e}")
+
+    def get_diagnostic_frame(self):
+        with self._frame_lock:
+            if getattr(self, '_latest_processed_frame', None) is not None:
+                return self._latest_processed_frame.copy()
+        return None
