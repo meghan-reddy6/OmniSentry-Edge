@@ -10,12 +10,19 @@ from src.common.bus import BaseAgent, EventBus
 logger = logging.getLogger(__name__)
 
 def create_qnn_session(npu_cfg: dict) -> ort.InferenceSession:
-    model_path = npu_cfg.get("model_path", "models/yolov8_det.onnx")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
+    """
+    Creates an ONNX Runtime session targeting the Qualcomm Hexagon NPU (HTP).
+    Prefers pre-compiled serialized context binaries for instant loading.
+    """
+    ctx_model_path = "models/yolov8_det_ctx.onnx"
+    base_model_path = npu_cfg.get("model_path", "models/yolov8_det.onnx")
+    
+    target_path = ctx_model_path if os.path.exists(ctx_model_path) else base_model_path
+    if not os.path.exists(target_path):
+        raise FileNotFoundError(f"Model file not found: {target_path}")
 
     available_eps = ort.get_available_providers()
-    logger.info(f"[VisionAgent]: Registered Execution Providers: {available_eps}")
+    logger.info(f"[VisionAgent]: Available Execution Providers: {available_eps}")
 
     qnn_options = {
         "backend_type": npu_cfg.get("backend_type", "htp"),
@@ -25,10 +32,10 @@ def create_qnn_session(npu_cfg: dict) -> ort.InferenceSession:
     }
 
     if "QNNExecutionProvider" in available_eps:
-        logger.info(f"[VisionAgent]: Routing {os.path.basename(model_path)} to Qualcomm Hexagon NPU (HTP)...")
+        logger.info(f"[VisionAgent]: Routing {os.path.basename(target_path)} to Qualcomm Hexagon NPU (HTP)...")
         providers = [("QNNExecutionProvider", qnn_options), "CPUExecutionProvider"]
     else:
-        logger.warning(f"[VisionAgent]: QNN unavailable for {os.path.basename(model_path)}. Falling back to CPU.")
+        logger.warning(f"[VisionAgent]: QNN unavailable for {os.path.basename(target_path)}. Falling back to CPU.")
         providers = ["CPUExecutionProvider"]
 
     session_options = ort.SessionOptions()
@@ -37,8 +44,12 @@ def create_qnn_session(npu_cfg: dict) -> ort.InferenceSession:
     session_options.inter_op_num_threads = npu_cfg.get("inter_op_threads", 1)
     session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
-    session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
-    logger.info(f"[VisionAgent]: Active providers for {os.path.basename(model_path)}: {session.get_providers()}")
+    if target_path == ctx_model_path:
+        session_options.add_session_config_entry("ep.context_enable", "1")
+        session_options.add_session_config_entry("ep.context_file_path", target_path)
+
+    session = ort.InferenceSession(target_path, sess_options=session_options, providers=providers)
+    logger.info(f"[VisionAgent]: Active runtime providers for {os.path.basename(target_path)}: {session.get_providers()}")
     return session
 
 
@@ -104,6 +115,10 @@ class VisionVLMAgent(BaseAgent):
         self.current_target_bbox = None
         self.smooth_box = None
 
+        from src.common.messages import TrackCommand, StateChangedEvent
+        self.subscribe(TrackCommand)
+        self.subscribe(StateChangedEvent)
+
         # NPU Engine Session
         self._session = create_qnn_session(npu_cfg)
 
@@ -118,6 +133,17 @@ class VisionVLMAgent(BaseAgent):
         
         self._camera_running = False
         self._camera_thread = None
+
+    async def handle_event(self, event):
+        if type(event).__name__ == "TrackCommand":
+            prompt = getattr(event, 'prompt', None) or getattr(event, 'target', None)
+            if prompt:
+                logger.info(f"[VisionAgent]: Received TrackCommand for prompt: '{prompt}'")
+                self.set_track_prompt(str(prompt))
+        elif type(event).__name__ == "StateChangedEvent":
+            new_state = getattr(event, 'new_state', None)
+            if new_state and str(new_state).endswith("IDLE"):
+                self.set_track_prompt(None)
 
     def _async_npu_worker(self):
         while self._infer_running:
