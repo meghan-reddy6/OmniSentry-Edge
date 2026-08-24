@@ -10,39 +10,36 @@ logger = logging.getLogger(__name__)
 
 def create_qnn_session(model_path: str) -> ort.InferenceSession:
     """
-    Instantiates ONNX Runtime session targeting Qualcomm Hexagon NPU (HTP)
-    per official Thundercomm Rubik Pi 3 specifications.
+    Creates an ONNX Runtime session targeting the Qualcomm Hexagon NPU (HTP)
+    using the official Rubik Pi 3 provider configuration.
     """
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
     available_eps = ort.get_available_providers()
-    logger.info(f"[VisionAgent]: Registered Execution Providers: {available_eps}")
+    logger.info(f"[VisionAgent]: Available Execution Providers: {available_eps}")
 
-    # Official Thundercomm QNN Execution Provider options for QCS6490 HTP
-    qnn_options = {
-        "backend_type": "htp",
-        "htp_performance_mode": "burst",
-        "htp_graph_finalization_optimization_mode": "3",
-        "profiling_level": "basic",
-    }
-
-    if "QNNExecutionProvider" in available_eps:
-        logger.info(f"[VisionAgent]: Routing {os.path.basename(model_path)} to Qualcomm Hexagon NPU (HTP)...")
-        providers = [("QNNExecutionProvider", qnn_options), "CPUExecutionProvider"]
-    else:
-        logger.warning(f"[VisionAgent]: QNNExecutionProvider unavailable for {os.path.basename(model_path)}. Falling back to CPU.")
-        providers = ["CPUExecutionProvider"]
+    # Official Rubik Pi 3 QNN Provider options (profiling set to 'off' to prevent CSV path error)
+    providers = [
+        ("QNNExecutionProvider", {
+            "backend_type": "htp",
+            "htp_performance_mode": "burst",
+            "htp_graph_finalization_optimization_mode": "3",
+            "profiling_level": "off",
+        }),
+        "CPUExecutionProvider"
+    ]
 
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    # CRITICAL: Clamp CPU worker threads to 2 to prevent CPU saturation
     session_options.intra_op_num_threads = 2
     session_options.inter_op_num_threads = 1
     session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
     session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
-    logger.info(f"[VisionAgent]: Active providers for {os.path.basename(model_path)}: {session.get_providers()}")
+    active_eps = session.get_providers()
+    logger.info(f"[VisionAgent]: Active providers for {os.path.basename(model_path)}: {active_eps}")
+
     return session
 
 
