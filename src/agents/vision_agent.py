@@ -480,7 +480,7 @@ class VisionVLMAgent:
         target_color = (0, 255, 128) if self.prompt_supported else (0, 100, 255)
 
         cv2.putText(frame, f"TARGET: {t_label}", (16, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.40, target_color, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"GIMBAL: PAN {self.current_pan:+.1f}° | TILT {self.current_tilt:+.1f}°", (16, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (148, 163, 184), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"GIMBAL: PAN {self.current_pan:+.1f} deg | TILT {self.current_tilt:+.1f} deg", (16, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (148, 163, 184), 1, cv2.LINE_AA)
         cv2.putText(frame, f"AUDIO: {self.current_mic_db:.1f} dB (FLOOR: {self.noise_floor:.1f} dB)", (16, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (56, 189, 248), 1, cv2.LINE_AA)
 
         # 5. Out-of-Vocabulary Warning Overlay
