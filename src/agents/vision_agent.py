@@ -300,12 +300,21 @@ class VisionVLMAgent:
 
     def _camera_capture_worker(self):
         """Dedicated thread continuously draining V4L2 kernel buffer to prevent video lag."""
-        self._cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
-        if not self._cap.isOpened():
-            self._cap = cv2.VideoCapture(self.camera_index)
-            
-        if not self._cap.isOpened():
-            logger.error(f"[VisionAgent]: Failed to open camera at index {self.camera_index}")
+        # Auto-discover camera index if the configured one is locked
+        indices_to_try = [self.camera_index, 0, 1, 2, 3]
+        
+        for idx in list(dict.fromkeys(indices_to_try)):  # Preserve order, remove duplicates
+            self._cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if not self._cap.isOpened():
+                self._cap = cv2.VideoCapture(idx)
+                
+            if self._cap.isOpened():
+                self.camera_index = idx
+                logger.info(f"[VisionAgent]: Camera hardware stream live on index {idx}")
+                break
+                
+        if not self._cap or not self._cap.isOpened():
+            logger.error(f"[VisionAgent]: Failed to open camera on any available index! Check USB connection.")
             return
 
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
@@ -314,7 +323,6 @@ class VisionVLMAgent:
         if self.fourcc:
             self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.fourcc))
 
-        logger.info(f"[VisionAgent]: Camera hardware stream live on index {self.camera_index}")
         while self._camera_running:
             ret, frame = self._cap.read()
             if not ret or frame is None:
