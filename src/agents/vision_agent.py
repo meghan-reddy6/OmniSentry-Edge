@@ -111,9 +111,13 @@ class VisionVLMAgent(BaseAgent):
         self._latest_raw_frame = None
         self._frame_lock = threading.Lock()
         self._latest_detections = []
+        
         self._infer_running = True
         self._infer_thread = threading.Thread(target=self._async_npu_worker, daemon=True)
         self._infer_thread.start()
+        
+        self._camera_running = False
+        self._camera_thread = None
 
     def _async_npu_worker(self):
         while self._infer_running:
@@ -196,11 +200,56 @@ class VisionVLMAgent(BaseAgent):
 
     async def start(self):
         logger.info("[VisionAgent]: VisionVLMAgent started.")
+        self._camera_running = True
+        self._camera_thread = threading.Thread(target=self._async_camera_worker, daemon=True)
+        self._camera_thread.start()
         return True
 
     async def stop(self):
         logger.info("[VisionAgent]: Stopping VisionVLMAgent...")
         self._infer_running = False
+        self._camera_running = False
         if hasattr(self, '_infer_thread') and self._infer_thread.is_alive():
             self._infer_thread.join(timeout=1.0)
+        if hasattr(self, '_camera_thread') and self._camera_thread and self._camera_thread.is_alive():
+            self._camera_thread.join(timeout=1.0)
         logger.info("[VisionAgent]: VisionVLMAgent stopped cleanly.")
+
+    def _async_camera_worker(self):
+        """Dedicated background thread for high-speed camera capture."""
+        logger.info(f"[VisionAgent]: Opening camera index {self.camera_index}")
+        
+        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(self.camera_index)
+            
+        if not cap.isOpened():
+            logger.error(f"[VisionAgent]: Failed to open camera index {self.camera_index}")
+            return
+            
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+        cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        
+        if hasattr(self, 'config') and self.config:
+            vision_cfg = self.config.get("vision", {}) if hasattr(self.config, "get") else getattr(self.config, "vision", {})
+            if isinstance(vision_cfg, dict):
+                cam_cfg = vision_cfg.get("camera", {})
+                fourcc = cam_cfg.get("fourcc", "MJPG")
+                if fourcc:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+
+        logger.info("[VisionAgent]: Camera stream initialized successfully.")
+        
+        while self._camera_running:
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning("[VisionAgent]: Failed to grab frame from camera.")
+                time.sleep(0.1)
+                continue
+                
+            # Process frame (flips, draws tracking overlays, and buffers for NPU)
+            self.process_frame(frame)
+
+        cap.release()
+        logger.info("[VisionAgent]: Camera hardware released.")
