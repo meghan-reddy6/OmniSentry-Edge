@@ -44,10 +44,6 @@ def create_qnn_session(npu_cfg: dict) -> ort.InferenceSession:
     session_options.inter_op_num_threads = npu_cfg.get("inter_op_threads", 1)
     session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
-    if target_path == ctx_model_path:
-        session_options.add_session_config_entry("ep.context_enable", "1")
-        session_options.add_session_config_entry("ep.context_file_path", target_path)
-
     session = ort.InferenceSession(target_path, sess_options=session_options, providers=providers)
     logger.info(f"[VisionAgent]: Active runtime providers for {os.path.basename(target_path)}: {session.get_providers()}")
     return session
