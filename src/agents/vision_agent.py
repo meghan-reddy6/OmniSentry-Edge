@@ -264,32 +264,12 @@ class VisionVLMAgent:
         logger.info("[VisionAgent]: Tracking STOPPED. Gimbal locked in Standby.")
 
     def _camera_capture_worker(self):
-        # Force integer coercion if the YAML parsed it as a string "0"
-        cam_idx = self.camera_index
-        if isinstance(cam_idx, str) and cam_idx.isdigit():
-            cam_idx = int(cam_idx)
-
-        self._cap = cv2.VideoCapture(cam_idx)
-        
-        # Explicit V4L2 fallback for Linux embedded boards
-        if not self._cap.isOpened() and isinstance(cam_idx, int):
-            logger.warning(f"[VisionAgent]: Default backend failed for camera {cam_idx}. Attempting V4L2 backend...")
-            self._cap = cv2.VideoCapture(cam_idx, cv2.CAP_V4L2)
-
-        if not self._cap.isOpened():
-            logger.error(f"[VisionAgent]: CRITICAL ERROR - Camera index {cam_idx} could not be opened.")
-            self._camera_running = False
-            return
-
-        # Attempt to set requested properties (some drivers may ignore these)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
-        self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
-
-        logger.info(f"[VisionAgent]: Camera hardware engaged at {self.frame_width}x{self.frame_height} @ {self.target_fps} FPS.")
-
         consecutive_failures = 0
         while self._camera_running:
+            if not self._cap or not self._cap.isOpened():
+                time.sleep(0.1)
+                continue
+                
             ret, frame = self._cap.read()
             if not ret or frame is None:
                 consecutive_failures += 1
@@ -304,6 +284,7 @@ class VisionVLMAgent:
 
         if self._cap:
             self._cap.release()
+            self._cap = None
 
     def _async_npu_worker(self):
         while self._infer_running:
@@ -502,6 +483,33 @@ class VisionVLMAgent:
         return frame
 
     async def start(self):
+        cam_idx = self.camera_index
+        if isinstance(cam_idx, str) and cam_idx.isdigit():
+            cam_idx = int(cam_idx)
+
+        # Initialize camera on the main thread to avoid OpenCV threading issues on Linux
+        self._cap = cv2.VideoCapture(cam_idx)
+        
+        if not self._cap.isOpened() and isinstance(cam_idx, int):
+            dev_path = f"/dev/video{cam_idx}"
+            logger.warning(f"[VisionAgent]: Default backend failed. Attempting explicit path: {dev_path} (V4L2)...")
+            self._cap = cv2.VideoCapture(dev_path, cv2.CAP_V4L2)
+            
+            if not self._cap.isOpened():
+                logger.warning(f"[VisionAgent]: V4L2 failed. Attempting GStreamer pipeline...")
+                gstreamer_pipeline = f"v4l2src device={dev_path} ! videoconvert ! appsink"
+                self._cap = cv2.VideoCapture(gstreamer_pipeline, cv2.CAP_GSTREAMER)
+
+        if not self._cap.isOpened():
+            logger.error(f"[VisionAgent]: CRITICAL ERROR - Camera {cam_idx} could not be opened.")
+            return False
+
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+        self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+
+        logger.info(f"[VisionAgent]: Camera hardware engaged at {self.frame_width}x{self.frame_height} @ {self.target_fps} FPS.")
+
         self._camera_running = True
         self._infer_running = True
         self._cam_thread = threading.Thread(target=self._camera_capture_worker, daemon=True)
