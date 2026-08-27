@@ -43,7 +43,6 @@ audio:
   calibrate_ambient_noise: true
 
 servos:
-  # Mode switch: "hardware" (real PCA9685 I2C) or "simulation" (mock fallback for PC testing)
   mode: "hardware"
   i2c_bus: 1
   i2c_address: 0x40
@@ -61,12 +60,16 @@ servos:
     min_angle: 45
     max_angle: 135
     base_angle: 70
-    invert: false
+    invert: true
 
-  # PID / Closed-loop control parameters
-  kp: 0.15
-  kd: 0.02
-  deadband: 0.05
+  # High-Speed Precision PID Parameters
+  pid:
+    kp_pan: 6.5           # Aggressive proportional gain for fast pan recovery
+    kd_pan: 1.2           # Derivative dampening to prevent pan overshoot
+    kp_tilt: 4.8          # Fast response for vertical motion
+    kd_tilt: 0.9          # Derivative dampening for tilt stability
+    deadband: 0.025       # Tight 2.5% deadband for center lock
+    max_step_deg: 6.0     # Maximum angular jump per cycle (prevents mechanical strain)
 
 orchestrator:
   auto_track_speaker: false

@@ -244,9 +244,28 @@ class VisionVLMAgent:
         self.current_mic_db = 0.0
         self.prompt_supported = True
         
-        # Hardware-synchronized default base angles
-        self.current_pan = 90.0
-        self.current_tilt = 70.0
+        servo_cfg = self.config.get("servos", {})
+        pid_cfg = servo_cfg.get("pid", {})
+
+        self.pan_base = float(servo_cfg.get("pan", {}).get("base_angle", 90.0))
+        self.tilt_base = float(servo_cfg.get("tilt", {}).get("base_angle", 70.0))
+        self.invert_pan = servo_cfg.get("pan", {}).get("invert", False)
+        self.invert_tilt = servo_cfg.get("tilt", {}).get("invert", True)
+
+        self.kp_pan = float(pid_cfg.get("kp_pan", 6.5))
+        self.kd_pan = float(pid_cfg.get("kd_pan", 1.2))
+        self.kp_tilt = float(pid_cfg.get("kp_tilt", 4.8))
+        self.kd_tilt = float(pid_cfg.get("kd_tilt", 0.9))
+        self.deadband = float(pid_cfg.get("deadband", 0.025))
+        self.max_step = float(pid_cfg.get("max_step_deg", 6.0))
+
+        # PID Error Memory & Timers
+        self._prev_error_x = 0.0
+        self._prev_error_y = 0.0
+        self._last_pid_time = time.time()
+
+        self.current_pan = self.pan_base
+        self.current_tilt = self.tilt_base
 
         # Camera & Async Frame Grabber Thread
         self._cap = None
@@ -282,8 +301,8 @@ class VisionVLMAgent:
         self.current_mic_db = getattr(event, 'current_db', self.current_mic_db)
 
     def handle_servo_update(self, event):
-        self.current_pan = getattr(event, 'pan', self.current_pan)
-        self.current_tilt = getattr(event, 'tilt', self.current_tilt)
+        self.current_pan = float(getattr(event, "pan", self.current_pan))
+        self.current_tilt = float(getattr(event, "tilt", self.current_tilt))
 
     def handle_track_command(self, event):
         prompt = getattr(event, 'prompt', None) or getattr(event, 'target', None)
@@ -400,6 +419,47 @@ class VisionVLMAgent:
 
             time.sleep(self.infer_throttle_sec)
 
+    def compute_pid_steps(self, error_x: float, error_y: float):
+        """Calculates fast, anti-overshoot angular adjustments."""
+        now = time.time()
+        dt = max(0.001, now - self._last_pid_time)
+        self._last_pid_time = now
+
+        step_pan = 0.0
+        step_tilt = 0.0
+
+        # --- Pan Axis (Horizontal) ---
+        if abs(error_x) > self.deadband:
+            # Derivative calculation
+            deriv_x = (error_x - self._prev_error_x) / dt
+            # Dynamic velocity scaling: speed increases with distance
+            boost_x = 1.0 + abs(error_x) * 1.5
+            p_term = error_x * self.kp_pan * boost_x
+            d_term = deriv_x * self.kd_pan
+
+            direction_x = 1.0 if self.invert_pan else -1.0
+            step_pan = direction_x * (p_term + d_term) * dt * 30.0
+            step_pan = max(-self.max_step, min(self.max_step, step_pan))
+            self._prev_error_x = error_x
+        else:
+            self._prev_error_x = 0.0
+
+        # --- Tilt Axis (Vertical) ---
+        if abs(error_y) > self.deadband:
+            deriv_y = (error_y - self._prev_error_y) / dt
+            boost_y = 1.0 + abs(error_y) * 1.2
+            p_term = error_y * self.kp_tilt * boost_y
+            d_term = deriv_y * self.kd_tilt
+
+            direction_y = 1.0 if self.invert_tilt else -1.0
+            step_tilt = direction_y * (p_term + d_term) * dt * 30.0
+            step_tilt = max(-self.max_step, min(self.max_step, step_tilt))
+            self._prev_error_y = error_y
+        else:
+            self._prev_error_y = 0.0
+
+        return step_pan, step_tilt
+
     def get_latest_processed_frame(self):
         frame = None
         with self._frame_lock:
@@ -446,12 +506,12 @@ class VisionVLMAgent:
             if self.smooth_box is None:
                 self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
             else:
-                self.smooth_box = self.smooth_alpha * np.array([bx, by, bw, bh], dtype=np.float32) + (1.0 - self.smooth_alpha) * self.smooth_box
+                # Lower smoothing latency (alpha = 0.75 for faster response)
+                self.smooth_box = 0.75 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.25 * self.smooth_box
 
             sx, sy, sw, sh = [int(v) for v in self.smooth_box]
             self.current_target_bbox = (sx, sy, sw, sh)
-            target_cx = sx + sw // 2
-            target_cy = sy + sh // 2
+            target_cx, target_cy = sx + sw // 2, sy + sh // 2
 
             # Target Lock Corner Brackets
             corner_len = 12
@@ -481,15 +541,16 @@ class VisionVLMAgent:
             error_x = (target_cx - cx_frame) / float(cx_frame)  # [-1.0 (left) .. +1.0 (right)]
             error_y = (target_cy - cy_frame) / float(cy_frame)  # [-1.0 (up) .. +1.0 (down)]
 
-            # Apply deadband
-            if abs(error_x) > 0.05 or abs(error_y) > 0.05:
-                step_pan = -error_x * 2.5
-                step_tilt = -error_y * 2.0
+            step_pan, step_tilt = self.compute_pid_steps(error_x, error_y)
+
+            if step_pan != 0.0 or step_tilt != 0.0:
                 new_pan = self.current_pan + step_pan
                 new_tilt = self.current_tilt + step_tilt
                 from src.common.bus import MoveServoCommand
                 self.bus.publish(MoveServoCommand(pan=new_pan, tilt=new_tilt))
         else:
+            self._prev_error_x = 0.0
+            self._prev_error_y = 0.0
             self.smooth_box = None
             self.current_target_bbox = None
 

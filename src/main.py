@@ -16,7 +16,8 @@ if project_root not in sys.path:
 
 from src.common.config import SystemConfig
 from src.common.bus import EventBus
-from src.common.messages import TrackCommand, MoveHomeCommand, SimulateSpeechCommand
+from src.common.messages import TrackCommand, SimulateSpeechCommand
+from src.common.bus import MoveServoCommand
 from src.agents.orchestrator import OrchestratorAgent
 from src.agents.audio_agent import AudioSensingAgent
 from src.agents.vision_agent import VisionVLMAgent
@@ -30,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-async def cli_input_loop(bus: EventBus, shutdown_event: asyncio.Event):
+async def cli_input_loop(bus: EventBus, config: SystemConfig, shutdown_event: asyncio.Event):
     """Asynchronous background task listening for command-line instructions to trigger tracking."""
     # Delay print slightly to allow agent bootup logging to complete
     await asyncio.sleep(1.5)
@@ -66,8 +67,12 @@ async def cli_input_loop(bus: EventBus, shutdown_event: asyncio.Event):
                 logger.info(f"CLI: Launching TrackCommand for prompt: '{prompt}'")
                 bus.publish(TrackCommand(prompt=prompt))
             elif cmd == "home":
-                logger.info("CLI: Command returning servos to center position.")
-                bus.publish(MoveHomeCommand())
+                pan_base = config.get("servos", {}).get("pan", {}).get("base_angle", 90.0)
+                tilt_base = config.get("servos", {}).get("tilt", {}).get("base_angle", 70.0)
+                logger.info(f"CLI: Returning gimbal to base neutral position ({pan_base}°, {tilt_base}°)")
+                bus.publish(MoveServoCommand(pan=float(pan_base), tilt=float(tilt_base)))
+                # Clear active tracking prompt so gimbal remains stationary at home
+                bus.publish(TrackCommand(prompt=""))
             elif cmd == "say":
                 if len(parts) < 2 or not parts[1].strip():
                     print("Error: Missing text for simulated speech (e.g. 'say sentry')")
@@ -114,7 +119,7 @@ async def main_async(config_path: str):
     logger.info("System fully operational. Registering input handlers...")
     
     # Spawn background interactive console reader
-    cli_task = asyncio.create_task(cli_input_loop(bus, shutdown_event))
+    cli_task = asyncio.create_task(cli_input_loop(bus, config, shutdown_event))
     
     try:
         # Wait until CLI signals exit via the shutdown event
