@@ -4,6 +4,7 @@ import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from pathlib import Path
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -205,7 +206,10 @@ class VisionVLMAgent:
         self.prompt_supported = True
 
         # NPU / QNN Session Initialization
-        model_path = npu_cfg.get("model_path", "models/yolov8_det.onnx")
+        REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+        model_cfg_path = npu_cfg.get("model_path", "models/yolov8_det.onnx")
+        model_path = str(REPO_ROOT / model_cfg_path) if not os.path.isabs(model_cfg_path) else model_cfg_path
+        
         available_eps = ort.get_available_providers()
         qnn_options = {
             "backend_type": npu_cfg.get("backend_type", "htp"),

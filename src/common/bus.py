@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 class Event:
     pass
 
+class TrackCommand(Event):
+    def __init__(self, prompt: str = ""):
+        self.prompt = prompt
+
 class MoveServoCommand(Event):
     def __init__(self, pan: float, tilt: float):
         self.pan = pan
@@ -23,6 +27,16 @@ class ServoTargetReachedEvent(Event):
     def __init__(self, pan: float, tilt: float):
         self.pan = pan
         self.tilt = tilt
+
+class SoundLocalizedEvent(Event):
+    def __init__(self, angle: float, volume: float = 0.0):
+        self.angle = angle
+        self.volume = volume
+
+class AudioTelemetryEvent(Event):
+    def __init__(self, current_db: float, noise_floor: float):
+        self.current_db = current_db
+        self.noise_floor = noise_floor
 
 class EventBus:
     def __init__(self):

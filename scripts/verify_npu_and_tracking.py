@@ -1,15 +1,21 @@
+import os
 import time
+from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 
-MODEL_PATH = "models/yolov8_det.onnx"
+# Resolve path relative to the repo root regardless of CWD
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = str(REPO_ROOT / "models" / "yolov8_det.onnx")
 
 def verify_npu_pipeline():
     print("==================================================")
     print(" OmniSentry-Edge: Hexagon HTP NPU & Logic Audit   ")
     print("==================================================")
 
-    # 1. Enforce strict NPU execution without CPU fallback
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Target model not found at resolved path: {MODEL_PATH}")
+
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
@@ -20,7 +26,7 @@ def verify_npu_pipeline():
         "profiling_level": "off"
     }
 
-    print("[1/3] Loading ONNX Session strictly onto Hexagon NPU...")
+    print(f"[1/3] Loading ONNX Session from {MODEL_PATH} onto Hexagon HTP NPU...")
     session = ort.InferenceSession(
         MODEL_PATH,
         sess_options=so,
@@ -31,7 +37,7 @@ def verify_npu_pipeline():
     print(f"      Active Execution Provider: {active_provider}")
     assert active_provider == "QNNExecutionProvider", "FAILED: QNNExecutionProvider is not active!"
 
-    # 2. Input/Output metadata validation
+    # Validate Tensor Signatures
     input_meta = session.get_inputs()[0]
     input_name = input_meta.name
     print(f"[2/3] Validating Tensor Signatures:")
@@ -43,15 +49,14 @@ def verify_npu_pipeline():
     print(f"      Outputs: {[(o.name, o.shape, o.type) for o in outputs]}")
     assert len(outputs) == 3, "Model must provide 3 output tensors (boxes, scores, class_idx)"
 
-    # 3. Hardware inference benchmark
+    # Hardware inference benchmark
     dummy_input = np.zeros((1, 3, 640, 640), dtype=np.uint8)
-    # Warmup
-    session.run(None, {input_name: dummy_input})
+    session.run(None, {input_name: dummy_input})  # Warmup
 
     runs = 100
     start = time.time()
     for _ in range(runs):
-        raw_out = session.run(None, {input_name: dummy_input})
+        _ = session.run(None, {input_name: dummy_input})
     total_sec = time.time() - start
     avg_ms = (total_sec / runs) * 1000.0
 
@@ -59,12 +64,11 @@ def verify_npu_pipeline():
     print(f"      Average Latency: {avg_ms:.2f} ms per frame")
     print(f"      Estimated FPS  : {1000.0 / avg_ms:.1f} FPS")
 
-    # 4. Angle quantization assertion
     pan_test, tilt_test = 92.483, 68.712
     int_pan, int_tilt = int(round(pan_test)), int(round(tilt_test))
     assert isinstance(int_pan, int) and isinstance(int_tilt, int)
     print("==================================================")
-    print(f" RESULT: 100% NPU Hardware Execution Verified!     ")
+    print(" RESULT: 100% NPU Hardware Execution Verified!     ")
     print("==================================================")
 
 if __name__ == "__main__":
