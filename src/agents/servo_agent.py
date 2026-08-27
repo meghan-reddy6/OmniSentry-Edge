@@ -106,23 +106,29 @@ class ServoActuatorAgent:
         target_tilt = getattr(event, "tilt", self.current_tilt)
         self.set_angles(target_pan, target_tilt)
 
-    def set_angles(self, pan_angle: float, tilt_angle: float):
-        # Strict boundary clamping
-        clamped_pan = max(self.pan_min, min(self.pan_max, float(pan_angle)))
-        clamped_tilt = max(self.tilt_min, min(self.tilt_max, float(tilt_angle)))
+    def set_angles(self, pan_angle, tilt_angle):
+        # 1. Round to strict integer degrees
+        int_pan = int(round(float(pan_angle)))
+        int_tilt = int(round(float(tilt_angle)))
 
-        self.current_pan = clamped_pan
-        self.current_tilt = clamped_tilt
+        # 2. Strict boundary clamping
+        clamped_pan = max(self.pan_min, min(self.pan_max, int_pan))
+        clamped_tilt = max(self.tilt_min, min(self.tilt_max, int_tilt))
 
-        if self.mode == "hardware" and self.driver:
-            try:
-                self.driver.set_servo_angle(self.pan_channel, self.current_pan)
-                self.driver.set_servo_angle(self.tilt_channel, self.current_tilt)
-            except Exception as e:
-                logger.error(f"[ServoAgent]: I2C write error: {e}")
+        # Only execute I2C write if angle has changed by at least 1 full degree
+        if clamped_pan != self.current_pan or clamped_tilt != self.current_tilt:
+            self.current_pan = clamped_pan
+            self.current_tilt = clamped_tilt
 
-        # Publish state update to EventBus for HUD sync
-        self.bus.publish(ServoTargetReachedEvent(pan=self.current_pan, tilt=self.current_tilt))
+            if self.mode == "hardware" and self.driver:
+                try:
+                    self.driver.set_servo_angle(self.pan_channel, self.current_pan)
+                    self.driver.set_servo_angle(self.tilt_channel, self.current_tilt)
+                except Exception as e:
+                    logger.error(f"[ServoAgent]: I2C write error: {e}")
+
+            # Publish integer state update to EventBus
+            self.bus.publish(ServoTargetReachedEvent(pan=self.current_pan, tilt=self.current_tilt))
 
     def home(self):
         """Restores pan and tilt servos to default base positions."""

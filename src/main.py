@@ -67,12 +67,13 @@ async def cli_input_loop(bus: EventBus, config: SystemConfig, shutdown_event: as
                 logger.info(f"CLI: Launching TrackCommand for prompt: '{prompt}'")
                 bus.publish(TrackCommand(prompt=prompt))
             elif cmd == "home":
-                pan_base = config.get("servos", {}).get("pan", {}).get("base_angle", 90.0)
-                tilt_base = config.get("servos", {}).get("tilt", {}).get("base_angle", 70.0)
-                logger.info(f"CLI: Returning gimbal to base neutral position ({pan_base}°, {tilt_base}°)")
-                bus.publish(MoveServoCommand(pan=float(pan_base), tilt=float(tilt_base)))
-                # Clear active tracking prompt so gimbal remains stationary at home
+                pan_base = float(config.get("servos", {}).get("pan", {}).get("base_angle", 90.0))
+                tilt_base = float(config.get("servos", {}).get("tilt", {}).get("base_angle", 70.0))
+                logger.info(f"CLI: Executing HOME -> Pan: {pan_base}°, Tilt: {tilt_base}° (Tracking Halted)")
+                # Stop tracking state first
                 bus.publish(TrackCommand(prompt=""))
+                # Drive servos to base position
+                bus.publish(MoveServoCommand(pan=pan_base, tilt=tilt_base))
             elif cmd == "say":
                 if len(parts) < 2 or not parts[1].strip():
                     print("Error: Missing text for simulated speech (e.g. 'say sentry')")

@@ -26,10 +26,9 @@ vision:
     input_height: 640
 
   tracking:
-    conf_threshold: 0.35
+    conf_threshold: 0.40
     nms_iou_threshold: 0.45
-    ema_alpha: 0.65
-    inference_fps_limit: 22
+    inference_fps_limit: 20
 
 audio:
   device_index: null            # null = auto-detect active microphone
@@ -62,14 +61,8 @@ servos:
     base_angle: 70
     invert: true
 
-  # High-Speed Precision PID Parameters
-  pid:
-    kp_pan: 6.5           # Aggressive proportional gain for fast pan recovery
-    kd_pan: 1.2           # Derivative dampening to prevent pan overshoot
-    kp_tilt: 4.8          # Fast response for vertical motion
-    kd_tilt: 0.9          # Derivative dampening for tilt stability
-    deadband: 0.025       # Tight 2.5% deadband for center lock
-    max_step_deg: 6.0     # Maximum angular jump per cycle (prevents mechanical strain)
+  # Integer Step Tracking Deadband
+  deadband: 0.05
 
 orchestrator:
   auto_track_speaker: false
