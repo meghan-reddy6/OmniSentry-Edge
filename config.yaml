@@ -42,35 +42,31 @@ audio:
   cooldown_sec: 0.25
   calibrate_ambient_noise: true
 
-servo:
-  driver: "pca9685"             # 'pca9685' or 'mock'
+servos:
+  # Mode switch: "hardware" (real PCA9685 I2C) or "simulation" (mock fallback for PC testing)
+  mode: "hardware"
   i2c_bus: 1
   i2c_address: 0x40
   pwm_frequency: 50
 
   pan:
     channel: 0
-    min_pulse_us: 500
-    max_pulse_us: 2500
-    min_angle_deg: -90.0
-    max_angle_deg: 90.0
-    home_angle_deg: 0.0
-    inverted: false
-    pid_kp: 0.08
-    pid_ki: 0.00
-    pid_kd: 0.01
+    min_angle: 0
+    max_angle: 180
+    base_angle: 90
+    invert: false
 
   tilt:
     channel: 1
-    min_pulse_us: 500
-    max_pulse_us: 2500
-    min_angle_deg: -30.0
-    max_angle_deg: 45.0
-    home_angle_deg: 0.0
-    inverted: false
-    pid_kp: 0.08
-    pid_ki: 0.00
-    pid_kd: 0.01
+    min_angle: 45
+    max_angle: 135
+    base_angle: 70
+    invert: false
+
+  # PID / Closed-loop control parameters
+  kp: 0.15
+  kd: 0.02
+  deadband: 0.05
 
 orchestrator:
   auto_track_speaker: false

@@ -243,6 +243,10 @@ class VisionVLMAgent:
         self.noise_floor = 0.0
         self.current_mic_db = 0.0
         self.prompt_supported = True
+        
+        # Hardware-synchronized default base angles
+        self.current_pan = 90.0
+        self.current_tilt = 70.0
 
         # Camera & Async Frame Grabber Thread
         self._cap = None
@@ -278,8 +282,8 @@ class VisionVLMAgent:
         self.current_mic_db = getattr(event, 'current_db', self.current_mic_db)
 
     def handle_servo_update(self, event):
-        self.current_pan = getattr(event, 'pan', getattr(self, 'current_pan', 0.0))
-        self.current_tilt = getattr(event, 'tilt', getattr(self, 'current_tilt', 0.0))
+        self.current_pan = getattr(event, 'pan', self.current_pan)
+        self.current_tilt = getattr(event, 'tilt', self.current_tilt)
 
     def handle_track_command(self, event):
         prompt = getattr(event, 'prompt', None) or getattr(event, 'target', None)
@@ -477,19 +481,13 @@ class VisionVLMAgent:
             error_x = (target_cx - cx_frame) / float(cx_frame)  # [-1.0 (left) .. +1.0 (right)]
             error_y = (target_cy - cy_frame) / float(cy_frame)  # [-1.0 (up) .. +1.0 (down)]
 
-            # Deadband check (5% threshold)
+            # Apply deadband
             if abs(error_x) > 0.05 or abs(error_y) > 0.05:
-                step_pan = -error_x * 2.5   # Invert X for pan alignment
-                step_tilt = -error_y * 2.0  # Invert Y for tilt alignment
-                current_pan = getattr(self, "current_pan", 0.0)
-                current_tilt = getattr(self, "current_tilt", 0.0)
-                new_pan = max(-90.0, min(90.0, current_pan + step_pan))
-                new_tilt = max(-30.0, min(45.0, current_tilt + step_tilt))
-                
-                class MoveServoCommand:
-                    def __init__(self, pan, tilt):
-                        self.pan = pan
-                        self.tilt = tilt
+                step_pan = -error_x * 2.5
+                step_tilt = -error_y * 2.0
+                new_pan = self.current_pan + step_pan
+                new_tilt = self.current_tilt + step_tilt
+                from src.common.bus import MoveServoCommand
                 self.bus.publish(MoveServoCommand(pan=new_pan, tilt=new_tilt))
         else:
             self.smooth_box = None
@@ -503,7 +501,7 @@ class VisionVLMAgent:
         target_color = (0, 255, 128) if self.prompt_supported else (0, 100, 255)
 
         cv2.putText(frame, f"TARGET: {t_label}", (16, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.40, target_color, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"GIMBAL: PAN {self.current_pan:+.1f} deg | TILT {self.current_tilt:+.1f} deg", (16, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (148, 163, 184), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"GIMBAL: PAN {self.current_pan:.1f}° | TILT {self.current_tilt:.1f}°", (16, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (148, 163, 184), 1, cv2.LINE_AA)
         cv2.putText(frame, f"AUDIO: {self.current_mic_db:.1f} dB (FLOOR: {self.noise_floor:.1f} dB)", (16, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (56, 189, 248), 1, cv2.LINE_AA)
 
         # 5. Out-of-Vocabulary Warning Overlay

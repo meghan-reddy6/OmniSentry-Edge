@@ -5,16 +5,11 @@ Manages physical 2-DOF Pan/Tilt gimbal actuation over the I2C bus using the PCA9
 Integrates clamping and mechanical limit translation. Evaluates MoveServoCommand events 
 broadcasted from the visual-PID loop or acoustic TDoA angle approximations.
 """
-import time
 import logging
-from src.common.bus import Event
+import threading
+from src.common.bus import MoveServoCommand, ServoTargetReachedEvent
 
 logger = logging.getLogger(__name__)
-
-class ServoTargetReachedEvent(Event):
-    def __init__(self, pan: float, tilt: float):
-        self.pan = pan
-        self.tilt = tilt
 
 class ServoActuatorAgent:
     """
@@ -27,66 +22,105 @@ class ServoActuatorAgent:
     def __init__(self, bus, config):
         self.bus = bus
         self.config = config
+        servo_cfg = self.config.get("servos", {})
 
-        srv_cfg = self.config.get("servo", {})
-        self.driver_type = srv_cfg.get("driver", "pca9685")
-        self.i2c_bus_num = srv_cfg.get("i2c_bus", 1)
-        self.i2c_addr = srv_cfg.get("i2c_address", 0x40)
+        # Mode: 'hardware' or 'simulation'
+        self.mode = servo_cfg.get("mode", "hardware").lower()
+        self.i2c_bus_num = servo_cfg.get("i2c_bus", 1)
+        self.i2c_address = servo_cfg.get("i2c_address", 0x40)
+        self.pwm_frequency = servo_cfg.get("pwm_frequency", 50)
 
-        self.pan_cfg = srv_cfg.get("pan", {})
-        self.tilt_cfg = srv_cfg.get("tilt", {})
+        # Pan Channel 0 (0° to 180°, base: 90°)
+        pan_cfg = servo_cfg.get("pan", {})
+        self.pan_channel = pan_cfg.get("channel", 0)
+        self.pan_min = pan_cfg.get("min_angle", 0)
+        self.pan_max = pan_cfg.get("max_angle", 180)
+        self.pan_base = pan_cfg.get("base_angle", 90)
 
-        self.current_pan = self.pan_cfg.get("home_angle_deg", 0.0)
-        self.current_tilt = self.tilt_cfg.get("home_angle_deg", 0.0)
+        # Tilt Channel 1 (45° to 135°, base: 70°)
+        tilt_cfg = servo_cfg.get("tilt", {})
+        self.tilt_channel = tilt_cfg.get("channel", 1)
+        self.tilt_min = tilt_cfg.get("min_angle", 45)
+        self.tilt_max = tilt_cfg.get("max_angle", 135)
+        self.tilt_base = tilt_cfg.get("base_angle", 70)
 
-        self._hardware_ready = False
-        self._init_pca9685()
+        # Initial live angles set to base
+        self.current_pan = float(self.pan_base)
+        self.current_tilt = float(self.tilt_base)
+
+        self.pca = None
+        self._servos = {}
+        self._init_hardware()
 
         self.bus.subscribe("MoveServoCommand", self.handle_move_command)
 
-    def _init_pca9685(self):
+    def _init_hardware(self):
+        if self.mode == "simulation":
+            logger.info("[ServoAgent]: Mode set to SIMULATION. Real I2C writes bypassed.")
+            return
+
         try:
+            import board
             import busio
-            from board import SCL, SDA
             from adafruit_pca9685 import PCA9685
             from adafruit_motor import servo
 
-            i2c = busio.I2C(SCL, SDA)
-            self.pca = PCA9685(i2c, address=self.i2c_addr)
-            self.pca.frequency = self.config.get("servo", {}).get("pwm_frequency", 50)
+            i2c = busio.I2C(board.SCL, board.SDA)
+            self.pca = PCA9685(i2c, address=self.i2c_address)
+            self.pca.frequency = self.pwm_frequency
 
-            self.pan_servo = servo.Servo(self.pca.channels[self.pan_cfg.get("channel", 0)])
-            self.tilt_servo = servo.Servo(self.pca.channels[self.tilt_cfg.get("channel", 1)])
-            self._hardware_ready = True
-            logger.info("[ServoAgent]: Native PCA9685 hardware initialized on I2C.")
+            self._servos[self.pan_channel] = servo.Servo(
+                self.pca.channels[self.pan_channel], min_pulse=500, max_pulse=2500
+            )
+            self._servos[self.tilt_channel] = servo.Servo(
+                self.pca.channels[self.tilt_channel], min_pulse=500, max_pulse=2500
+            )
+
+            # Move to default base position on hardware boot
+            self.set_angles(self.pan_base, self.tilt_base)
+            logger.info(f"[ServoAgent]: PCA9685 Hardware active on I2C 0x{self.i2c_address:02X} (Pan Ch:{self.pan_channel}, Tilt Ch:{self.tilt_channel})")
         except Exception as e:
-            logger.warning(f"[ServoAgent]: PCA9685 hardware init failed ({e}). Operating in simulation.")
-            self._hardware_ready = False
+            logger.warning(f"[ServoAgent]: Hardware initialization failed ({e}). Auto-falling back to SIMULATION.")
+            self.mode = "simulation"
 
     def handle_move_command(self, event):
-        target_pan = getattr(event, 'pan', self.current_pan)
-        target_tilt = getattr(event, 'tilt', self.current_tilt)
+        target_pan = getattr(event, "pan", self.current_pan)
+        target_tilt = getattr(event, "tilt", self.current_tilt)
+        self.set_angles(target_pan, target_tilt)
 
-        # Clamp against physical limits
-        target_pan = max(self.pan_cfg.get("min_angle_deg", -90.0), min(self.pan_cfg.get("max_angle_deg", 90.0), target_pan))
-        target_tilt = max(self.tilt_cfg.get("min_angle_deg", -30.0), min(self.tilt_cfg.get("max_angle_deg", 45.0), target_tilt))
+    def set_angles(self, pan_angle: float, tilt_angle: float):
+        # Strict boundary clamping
+        clamped_pan = max(self.pan_min, min(self.pan_max, float(pan_angle)))
+        clamped_tilt = max(self.tilt_min, min(self.tilt_max, float(tilt_angle)))
 
-        self.current_pan = target_pan
-        self.current_tilt = target_tilt
+        self.current_pan = clamped_pan
+        self.current_tilt = clamped_tilt
 
-        if self._hardware_ready:
+        if self.mode == "hardware" and self.pca:
             try:
-                # Map [-90, +90] to [0, 180] for Adafruit servo API
-                self.pan_servo.angle = target_pan + 90.0
-                self.tilt_servo.angle = target_tilt + 90.0
+                self._servos[self.pan_channel].angle = clamped_pan
+                self._servos[self.tilt_channel].angle = clamped_tilt
             except Exception as e:
-                logger.error(f"[ServoAgent]: Servo write error: {e}")
+                logger.error(f"[ServoAgent]: I2C write error: {e}")
 
+        # Broadcast state update to Vision HUD and Orchestrator
         self.bus.publish(ServoTargetReachedEvent(pan=self.current_pan, tilt=self.current_tilt))
 
+    def home(self):
+        """Restores pan and tilt servos to neutral base positions."""
+        self.set_angles(self.pan_base, self.tilt_base)
+        logger.info(f"[ServoAgent]: Servos homed to Base (Pan: {self.pan_base}°, Tilt: {self.tilt_base}°)")
+
     async def start(self):
-        logger.info("[ServoAgent]: Servo actuator agent started.")
+        self.home()
+        logger.info(f"[ServoAgent]: Servo actuator agent started (Mode: {self.mode.upper()}).")
         return True
 
     async def stop(self):
+        self.home()
+        if self.pca:
+            try:
+                self.pca.deinit()
+            except Exception:
+                pass
         logger.info("[ServoAgent]: Servo actuator stopped.")

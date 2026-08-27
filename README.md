@@ -65,6 +65,9 @@
 - **Camera**: Standard V4L2 USB / MIPI camera (`/dev/video0`).
 - **Microphone**: Stereo 2-channel ALSA microphone array.
 - **Actuation**: PCA9685 I2C PWM driver connected to I2C Bus 1 (`/dev/i2c-1`, address 0x40).
+  - **Pan (Ch 0)**: Range $0^\circ\text{--}180^\circ$, Base $90^\circ$
+  - **Tilt (Ch 1)**: Range $45^\circ\text{--}135^\circ$, Base $70^\circ$
+  - *Note: Servo mode can be switched to `"simulation"` in `config.yaml` for offline testing.*
 
 ### 2. Installation & Setup
 ```bash

@@ -14,6 +14,16 @@ logger = logging.getLogger(__name__)
 class Event:
     pass
 
+class MoveServoCommand(Event):
+    def __init__(self, pan: float, tilt: float):
+        self.pan = pan
+        self.tilt = tilt
+
+class ServoTargetReachedEvent(Event):
+    def __init__(self, pan: float, tilt: float):
+        self.pan = pan
+        self.tilt = tilt
+
 class EventBus:
     def __init__(self):
         self._subscribers: Dict[str, List[Callable]] = {}
