@@ -23,7 +23,7 @@
   |                                                                                   |
   |  +--------------------+   +---------------------------------+  +---------------+  |
   |  | AudioSensingAgent  |   |        VisionVLMAgent           |  |ServoActuator  |  |
-  |  | - 16kHz PyAudio    |   | - 30 FPS Async V4L2 Ingestion   |  | - PCA9685 I2C |  |
+  |  | - 16kHz PyAudio    |   | - 30 FPS Async V4L2 Ingestion   |  | - smbus2 I2C  |  |
   |  | - Dynamic VAD (dB) |   | - QNN HTP (Hexagon UINT8 NPU)   |  | - PID Loop    |  |
   |  | - GCC-PHAT TDoA    |   | - EMA Bbox Smoothing (α=0.65)   |  | - Deadband    |  |
   |  | - Angle Smoothing  |   | - HTTP 30 FPS MJPEG Stream      |  | - Clamping    |  |

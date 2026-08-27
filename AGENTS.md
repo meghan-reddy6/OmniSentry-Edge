@@ -18,7 +18,7 @@
 - **De-Jitter:** Debounced cooldown timer ($0.25\text{s}$) with confidence filtering ($\ge 0.45$).
 
 ## 3. ServoActuatorAgent (`src/agents/servo_agent.py`)
-- **Driver:** Native I2C `adafruit_pca9685` / `busio` driver with seamless `simulation` mode fallback.
+- **Driver:** Native I2C direct register writes via `smbus2` with seamless `simulation` mode fallback.
 - **Kinematic Constraints:**
   - Pan (Channel 0): Range $[0^\circ, 180^\circ]$, Default Base: $90^\circ$
   - Tilt (Channel 1): Range $[45^\circ, 135^\circ]$, Default Base: $70^\circ$
