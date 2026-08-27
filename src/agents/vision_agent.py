@@ -264,16 +264,41 @@ class VisionVLMAgent:
         logger.info("[VisionAgent]: Tracking STOPPED. Gimbal locked in Standby.")
 
     def _camera_capture_worker(self):
-        self._cap = cv2.VideoCapture(self.camera_index)
+        # Force integer coercion if the YAML parsed it as a string "0"
+        cam_idx = self.camera_index
+        if isinstance(cam_idx, str) and cam_idx.isdigit():
+            cam_idx = int(cam_idx)
+
+        self._cap = cv2.VideoCapture(cam_idx)
+        
+        # Explicit V4L2 fallback for Linux embedded boards
+        if not self._cap.isOpened() and isinstance(cam_idx, int):
+            logger.warning(f"[VisionAgent]: Default backend failed for camera {cam_idx}. Attempting V4L2 backend...")
+            self._cap = cv2.VideoCapture(cam_idx, cv2.CAP_V4L2)
+
+        if not self._cap.isOpened():
+            logger.error(f"[VisionAgent]: CRITICAL ERROR - Camera index {cam_idx} could not be opened.")
+            self._camera_running = False
+            return
+
+        # Attempt to set requested properties (some drivers may ignore these)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
         self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
 
+        logger.info(f"[VisionAgent]: Camera hardware engaged at {self.frame_width}x{self.frame_height} @ {self.target_fps} FPS.")
+
+        consecutive_failures = 0
         while self._camera_running:
             ret, frame = self._cap.read()
             if not ret or frame is None:
+                consecutive_failures += 1
+                if consecutive_failures % 100 == 0:
+                    logger.warning("[VisionAgent]: Continuous frame read failures detected. Is the camera unplugged?")
                 time.sleep(0.01)
                 continue
+            
+            consecutive_failures = 0
             with self._frame_lock:
                 self._raw_frame = frame
 
