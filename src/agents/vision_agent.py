@@ -398,16 +398,22 @@ class VisionVLMAgent:
             return
 
         now = time.time()
+        # Ensure a minimum 45ms window between motor writes so the servo physically
+        # completes its travel before receiving the next target pulse
+        if not hasattr(self, "_last_servo_cmd_time"):
+            self._last_servo_cmd_time = 0.0
+        if (now - self._last_servo_cmd_time) < 0.045:
+            return
+
         matched_box = self._select_locked_target(self._latest_detections, self.current_prompt)
 
         if matched_box is not None:
             bx, by, bw, bh = matched_box
 
-            # Heavy low-pass EMA filter (80% historical weight) to eliminate pixel flutter
             if self.smooth_box is None:
                 self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
             else:
-                self.smooth_box = 0.20 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.80 * self.smooth_box
+                self.smooth_box = 0.30 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.70 * self.smooth_box
 
             sx, sy, sw, sh = [int(v) for v in self.smooth_box]
             self.locked_target_bbox = [sx, sy, sw, sh]
@@ -427,37 +433,49 @@ class VisionVLMAgent:
         target_cx = bx + bw // 2
         target_cy = by + bh // 2
 
-        # Error normalized to [-1.0, 1.0]
         error_x = (target_cx - cx_frame) / float(cx_frame)
         error_y = (target_cy - cy_frame) / float(cy_frame)
 
-        # Retrieve deadband from config (fallback to 0.08)
         deadband = float(self.config.get("servos", {}).get("deadband", 0.08))
 
         step_pan = 0
         step_tilt = 0
 
-        # Pan Axis: Zero step inside deadband; ramp gently from 0 at the boundary (NO forced min step)
+        # Pan axis calculation
         if abs(error_x) > deadband:
             effective_err_x = abs(error_x) - deadband
-            deg_x = int(round(effective_err_x * 3.0))
-            if deg_x >= 1:
-                dir_x = 1 if self.invert_pan else -1
-                step_pan = dir_x * (deg_x if error_x > 0 else -deg_x)
+            raw_deg_x = int(round(effective_err_x * 4.0))
+            # Breakaway torque: If motion is required, command at least 2 degrees
+            # so the servo overcomes static gearbox friction rather than humming
+            deg_x = max(2, raw_deg_x)
+            dir_x = 1 if self.invert_pan else -1
+            step_pan = dir_x * (deg_x if error_x > 0 else -deg_x)
 
-        # Tilt Axis: Zero step inside deadband; ramp gently from 0 at the boundary (NO forced min step)
+        # Tilt axis calculation
         if abs(error_y) > deadband:
             effective_err_y = abs(error_y) - deadband
-            deg_y = int(round(effective_err_y * 2.5))
-            if deg_y >= 1:
-                dir_y = 1 if self.invert_tilt else -1
-                step_tilt = dir_y * (deg_y if error_y > 0 else -deg_y)
+            raw_deg_y = int(round(effective_err_y * 3.0))
+            deg_y = max(2, raw_deg_y)
+            dir_y = 1 if self.invert_tilt else -1
+            step_tilt = dir_y * (deg_y if error_y > 0 else -deg_y)
 
-        # Only dispatch commands when there is a true integer degree delta
         if step_pan != 0 or step_tilt != 0:
-            new_pan = int(round(self.current_pan + step_pan))
-            new_tilt = int(round(self.current_tilt + step_tilt))
-            self.bus.publish(MoveServoCommand(pan=new_pan, tilt=new_tilt))
+            pan_cfg = self.config.get("servos", {}).get("pan", {})
+            tilt_cfg = self.config.get("servos", {}).get("tilt", {})
+
+            min_p = int(pan_cfg.get("min_angle", 30))
+            max_p = int(pan_cfg.get("max_angle", 150))
+            min_t = int(tilt_cfg.get("min_angle", 50))
+            max_t = int(tilt_cfg.get("max_angle", 100))
+
+            target_pan = max(min_p, min(max_p, self.current_pan + step_pan))
+            target_tilt = max(min_t, min(max_t, self.current_tilt + step_tilt))
+
+            if target_pan != self.current_pan or target_tilt != self.current_tilt:
+                self.current_pan = target_pan
+                self.current_tilt = target_tilt
+                self._last_servo_cmd_time = now
+                self.bus.publish(MoveServoCommand(pan=self.current_pan, tilt=self.current_tilt))
 
     def get_latest_processed_frame(self):
         """Read-only display renderer for the MJPEG diagnostic stream."""
