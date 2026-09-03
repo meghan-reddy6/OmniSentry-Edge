@@ -394,7 +394,6 @@ class VisionVLMAgent:
         return matching_boxes[0][0]
 
     def _process_servo_tracking_step(self, w, h):
-        """High-speed responsive tracking step calculation."""
         if not self.is_tracking_active or not self.current_prompt:
             return
 
@@ -403,11 +402,12 @@ class VisionVLMAgent:
 
         if matched_box is not None:
             bx, by, bw, bh = matched_box
-            # Responsive box smoothing
+
+            # Heavy low-pass EMA filter (80% historical weight) to eliminate pixel flutter
             if self.smooth_box is None:
                 self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
             else:
-                self.smooth_box = 0.75 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.25 * self.smooth_box
+                self.smooth_box = 0.20 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.80 * self.smooth_box
 
             sx, sy, sw, sh = [int(v) for v in self.smooth_box]
             self.locked_target_bbox = [sx, sy, sw, sh]
@@ -422,34 +422,38 @@ class VisionVLMAgent:
                 self.smooth_box = None
             return
 
-        # Target center calculation
         bx, by, bw, bh = self.locked_target_bbox
         cx_frame, cy_frame = w // 2, h // 2
         target_cx = bx + bw // 2
         target_cy = by + bh // 2
 
-        # Error normalized between -1.0 and +1.0
+        # Error normalized to [-1.0, 1.0]
         error_x = (target_cx - cx_frame) / float(cx_frame)
         error_y = (target_cy - cy_frame) / float(cy_frame)
 
-        # High-Speed Dynamic Stepping
-        deadband = 0.025  # Tight 2.5% deadband
+        # Retrieve deadband from config (fallback to 0.08)
+        deadband = float(self.config.get("servos", {}).get("deadband", 0.08))
+
         step_pan = 0
         step_tilt = 0
 
+        # Pan Axis: Zero step inside deadband; ramp gently from 0 at the boundary (NO forced min step)
         if abs(error_x) > deadband:
-            dir_x = 1 if self.invert_pan else -1
-            # Dynamic velocity: speed increases exponentially with distance
-            boost_x = 1.0 + abs(error_x) * 2.0
-            deg_x = max(1, int(round(abs(error_x) * 4.5 * boost_x)))
-            step_pan = dir_x * (deg_x if error_x > 0 else -deg_x)
+            effective_err_x = abs(error_x) - deadband
+            deg_x = int(round(effective_err_x * 3.0))
+            if deg_x >= 1:
+                dir_x = 1 if self.invert_pan else -1
+                step_pan = dir_x * (deg_x if error_x > 0 else -deg_x)
 
+        # Tilt Axis: Zero step inside deadband; ramp gently from 0 at the boundary (NO forced min step)
         if abs(error_y) > deadband:
-            dir_y = 1 if self.invert_tilt else -1
-            boost_y = 1.0 + abs(error_y) * 1.5
-            deg_y = max(1, int(round(abs(error_y) * 3.5 * boost_y)))
-            step_tilt = dir_y * (deg_y if error_y > 0 else -deg_y)
+            effective_err_y = abs(error_y) - deadband
+            deg_y = int(round(effective_err_y * 2.5))
+            if deg_y >= 1:
+                dir_y = 1 if self.invert_tilt else -1
+                step_tilt = dir_y * (deg_y if error_y > 0 else -deg_y)
 
+        # Only dispatch commands when there is a true integer degree delta
         if step_pan != 0 or step_tilt != 0:
             new_pan = int(round(self.current_pan + step_pan))
             new_tilt = int(round(self.current_tilt + step_tilt))
