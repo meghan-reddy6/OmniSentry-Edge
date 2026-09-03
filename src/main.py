@@ -41,6 +41,7 @@ async def cli_input_loop(bus: EventBus, config: SystemConfig, shutdown_event: as
     print("Available Commands:")
     print("  track <prompt>  - Initialize VLM tracking loop (e.g. 'track cup')")
     print("  home            - Command the Pan/Tilt servos back to home (0, 0)")
+    print("  goto <p> <t>    - Move gimbal to explicit pan/tilt coords (e.g. 'goto 120 70')")
     print("  say <phrase>    - Inject a simulated voice command transcription")
     print("  exit            - Stop all agents and terminate the program")
     print("="*60 + "\n")
@@ -81,8 +82,27 @@ async def cli_input_loop(bus: EventBus, config: SystemConfig, shutdown_event: as
                 phrase = parts[1].strip()
                 logger.info(f"CLI: Injecting simulated speech transcript: '{phrase}'")
                 bus.publish(SimulateSpeechCommand(text=phrase))
+            elif cmd == "goto" or cmd == "move":
+                if len(parts) == 2:
+                    coords = parts[1].split()
+                    if len(coords) == 2:
+                        try:
+                            target_pan = int(round(float(coords[0])))
+                            target_tilt = int(round(float(coords[1])))
+
+                            # Disengage any active tracking loop so it doesn't fight manual coordinates
+                            bus.publish(TrackCommand(prompt=""))
+
+                            logger.info(f"CLI: Manual coordinate command -> Pan: {target_pan} deg, Tilt: {target_tilt} deg")
+                            bus.publish(MoveServoCommand(pan=target_pan, tilt=target_tilt))
+                        except ValueError:
+                            print("Invalid angles. Format: goto <pan_deg> <tilt_deg> (e.g. 'goto 90 65')")
+                    else:
+                        print("Usage: goto <pan> <tilt> (e.g. 'goto 120 70')")
+                else:
+                    print("Usage: goto <pan> <tilt> (e.g. 'goto 120 70')")
             else:
-                print(f"Unknown command: '{cmd}'. Commands: 'track <prompt>', 'home', 'say <phrase>', 'exit'")
+                print(f"Unknown command: '{cmd}'. Commands: 'track <prompt>', 'home', 'goto <pan> <tilt>', 'say <phrase>', 'exit'")
         except asyncio.CancelledError:
             break
         except Exception as e:
