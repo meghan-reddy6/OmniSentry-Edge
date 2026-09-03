@@ -199,6 +199,7 @@ class VisionVLMAgent:
         self.is_tracking_active = False
         self.current_prompt = None
         self.locked_target_bbox = None       # [x, y, w, h]
+        self.smooth_box = None
         self.lock_lost_timestamp = None
         self.lock_grace_period_sec = 1.0     # Hold position for 1.0s if detection drops
         self.deadband = float(servo_cfg.get("deadband", 0.05))
@@ -340,22 +341,36 @@ class VisionVLMAgent:
         iou = interArea / float(boxAArea + boxBArea - interArea + 1e-5)
         return iou
 
+    def _extract_face_box(self, person_box):
+        """Derives a face/head bounding box from the top region of a detected person box."""
+        px, py, pw, ph = person_box
+        # Face typically occupies the top ~25-30% in height and center ~60-70% in width
+        fw = int(pw * 0.65)
+        fh = int(ph * 0.28)
+        fx = px + int((pw - fw) / 2.0)
+        fy = py + int(ph * 0.02)  # Slight offset from top edge
+        return [max(0, fx), max(0, fy), max(20, fw), max(20, fh)]
+
     def _select_locked_target(self, candidate_detections, prompt):
-        """Picks the best candidate matching prompt, prioritizing spatial continuity."""
         target_lower = prompt.lower()
         matching_boxes = []
+
+        is_face_mode = target_lower in ("face", "head")
 
         for box, conf, cid, lbl in candidate_detections:
             lbl_lower = lbl.lower()
             is_match = (target_lower in lbl_lower) or \
-                       (target_lower in ("face", "person", "head") and lbl_lower in ("person", "face"))
+                       (is_face_mode and lbl_lower in ("person", "face")) or \
+                       (target_lower == "person" and lbl_lower == "person")
             if is_match:
-                matching_boxes.append((box, conf))
+                # If searching for face/head, derive the face box from the detected person
+                target_box = self._extract_face_box(box) if (is_face_mode or target_lower == "face") else box
+                matching_boxes.append((target_box, conf))
 
         if not matching_boxes:
             return None
 
-        # If already locked onto a target, pick the closest candidate by IoU / Euclidean distance
+        # Lock persistence via IoU & spatial proximity
         if self.locked_target_bbox is not None:
             best_box = None
             best_score = -1.0
@@ -368,18 +383,18 @@ class VisionVLMAgent:
                 cand_cy = box[1] + box[3] // 2
                 dist = np.hypot(cand_cx - prev_cx, cand_cy - prev_cy)
 
-                # Score combines IoU and spatial proximity
-                score = (iou * 2.0) + (1.0 / (1.0 + dist * 0.01)) + (conf * 0.5)
+                score = (iou * 2.5) + (1.0 / (1.0 + dist * 0.008)) + (conf * 0.5)
                 if score > best_score:
                     best_score = score
                     best_box = box
             return best_box
 
-        # If acquiring lock for first time, choose highest confidence detection
+        # First acquisition: highest confidence
         matching_boxes.sort(key=lambda x: x[1], reverse=True)
         return matching_boxes[0][0]
 
     def _process_servo_tracking_step(self, w, h):
+        """High-speed responsive tracking step calculation."""
         if not self.is_tracking_active or not self.current_prompt:
             return
 
@@ -387,38 +402,52 @@ class VisionVLMAgent:
         matched_box = self._select_locked_target(self._latest_detections, self.current_prompt)
 
         if matched_box is not None:
-            self.locked_target_bbox = matched_box
+            bx, by, bw, bh = matched_box
+            # Responsive box smoothing
+            if self.smooth_box is None:
+                self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
+            else:
+                self.smooth_box = 0.75 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.25 * self.smooth_box
+
+            sx, sy, sw, sh = [int(v) for v in self.smooth_box]
+            self.locked_target_bbox = [sx, sy, sw, sh]
+            self.current_target_bbox = (sx, sy, sw, sh)
             self.lock_lost_timestamp = None
         else:
-            # Target temporarily lost: enter grace period and hold position (no wandering)
             if self.lock_lost_timestamp is None:
                 self.lock_lost_timestamp = now
             elif (now - self.lock_lost_timestamp) > self.lock_grace_period_sec:
-                self.locked_target_bbox = None  # Lock expired
+                self.locked_target_bbox = None
+                self.current_target_bbox = None
+                self.smooth_box = None
             return
 
-        # Perform visual servo step on locked target
+        # Target center calculation
         bx, by, bw, bh = self.locked_target_bbox
         cx_frame, cy_frame = w // 2, h // 2
         target_cx = bx + bw // 2
         target_cy = by + bh // 2
 
+        # Error normalized between -1.0 and +1.0
         error_x = (target_cx - cx_frame) / float(cx_frame)
         error_y = (target_cy - cy_frame) / float(cy_frame)
 
+        # High-Speed Dynamic Stepping
+        deadband = 0.025  # Tight 2.5% deadband
         step_pan = 0
         step_tilt = 0
 
-        # Deadband & Integer Step Calculation
-        if abs(error_x) > self.deadband:
+        if abs(error_x) > deadband:
             dir_x = 1 if self.invert_pan else -1
-            # Step in discrete 1° to 3° integer increments
-            deg_x = max(1, int(round(abs(error_x) * 3.0)))
+            # Dynamic velocity: speed increases exponentially with distance
+            boost_x = 1.0 + abs(error_x) * 2.0
+            deg_x = max(1, int(round(abs(error_x) * 4.5 * boost_x)))
             step_pan = dir_x * (deg_x if error_x > 0 else -deg_x)
 
-        if abs(error_y) > self.deadband:
+        if abs(error_y) > deadband:
             dir_y = 1 if self.invert_tilt else -1
-            deg_y = max(1, int(round(abs(error_y) * 2.0)))
+            boost_y = 1.0 + abs(error_y) * 1.5
+            deg_y = max(1, int(round(abs(error_y) * 3.5 * boost_y)))
             step_tilt = dir_y * (deg_y if error_y > 0 else -deg_y)
 
         if step_pan != 0 or step_tilt != 0:
@@ -478,7 +507,7 @@ class VisionVLMAgent:
             status_color = (148, 163, 184)
 
         cv2.putText(frame, f"STATUS: {status_text}", (16, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.40, status_color, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"GIMBAL: {int(self.current_pan)}° | {int(self.current_tilt)}°", (16, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (148, 163, 184), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"GIMBAL: {int(self.current_pan)} deg | {int(self.current_tilt)} deg", (16, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (148, 163, 184), 1, cv2.LINE_AA)
 
         return frame
 

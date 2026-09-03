@@ -83,7 +83,7 @@ class SystemConfig:
                     if "servos" in loaded and "servo" not in loaded:
                         loaded["servo"] = loaded["servos"]
                     if "system" in loaded and isinstance(loaded["system"], dict):
-                        system_mode = loaded["system"].get("mode", "SIMULATION")
+                        system_mode = str(loaded["system"].get("mode", "SIMULATION")).upper()
                         loaded["simulation_mode"] = (system_mode == "SIMULATION")
                     
                     self._update_recursive(self._config, loaded)
