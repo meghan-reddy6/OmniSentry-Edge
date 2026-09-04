@@ -25,7 +25,9 @@ DEFAULT_COCO_CLASSES = [
     "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
 ]
 
-def load_labels(labels_path="models/labels.txt"):
+def load_labels(labels_path=None):
+    if labels_path is None:
+        labels_path = str(Path(__file__).resolve().parent.parent.parent / "models" / "labels.txt")
     if os.path.exists(labels_path):
         try:
             with open(labels_path, "r") as f:
@@ -205,6 +207,7 @@ class VisionVLMAgent:
         self.deadband = float(servo_cfg.get("deadband", 0.05))
 
         self.prompt_supported = True
+        self._inference_buffer = np.empty((self.frame_height, self.frame_width, 3), dtype=np.uint8)
 
         # NPU / QNN Session Initialization
         REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -289,14 +292,19 @@ class VisionVLMAgent:
 
     def _async_npu_worker(self):
         while self._infer_running:
-            frame = None
+            loop_start = time.time()
+            has_frame = False
+
             with self._frame_lock:
                 if self._raw_frame is not None:
-                    frame = self._raw_frame.copy()
+                    np.copyto(self._inference_buffer, self._raw_frame)
+                    has_frame = True
 
-            if frame is None:
-                time.sleep(0.02)
+            if not has_frame:
+                time.sleep(0.01)
                 continue
+
+            frame = self._inference_buffer
 
             # Run NPU inference only if tracking is actively engaged
             if not self.is_tracking_active or not self.current_prompt:
@@ -328,7 +336,10 @@ class VisionVLMAgent:
                 logger.error(f"[VisionAgent]: Inference error: {e}")
                 time.sleep(0.05)
 
-            time.sleep(self.infer_throttle_sec)
+            elapsed = time.time() - loop_start
+            sleep_time = max(0.0, self.infer_throttle_sec - elapsed)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     def _compute_iou(self, boxA, boxB):
         xA = max(boxA[0], boxB[0])
@@ -398,11 +409,11 @@ class VisionVLMAgent:
             return
 
         now = time.time()
-        # Ensure a minimum 45ms window between motor writes so the servo physically
+        # Ensure a minimum 75ms window between motor writes so the servo physically
         # completes its travel before receiving the next target pulse
         if not hasattr(self, "_last_servo_cmd_time"):
             self._last_servo_cmd_time = 0.0
-        if (now - self._last_servo_cmd_time) < 0.045:
+        if (now - self._last_servo_cmd_time) < 0.075:
             return
 
         matched_box = self._select_locked_target(self._latest_detections, self.current_prompt)
@@ -413,7 +424,7 @@ class VisionVLMAgent:
             if self.smooth_box is None:
                 self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
             else:
-                self.smooth_box = 0.30 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.70 * self.smooth_box
+                self.smooth_box = 0.15 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.85 * self.smooth_box
 
             sx, sy, sw, sh = [int(v) for v in self.smooth_box]
             self.locked_target_bbox = [sx, sy, sw, sh]
@@ -433,8 +444,11 @@ class VisionVLMAgent:
         target_cx = bx + bw // 2
         target_cy = by + bh // 2
 
-        error_x = (target_cx - cx_frame) / float(cx_frame)
-        error_y = (target_cy - cy_frame) / float(cy_frame)
+        # Safeguard against 0 or negative center dimensions
+        denom_x = max(1.0, float(cx_frame))
+        denom_y = max(1.0, float(cy_frame))
+        error_x = (target_cx - cx_frame) / denom_x
+        error_y = (target_cy - cy_frame) / denom_y
 
         deadband = float(self.config.get("servos", {}).get("deadband", 0.08))
 
@@ -448,7 +462,7 @@ class VisionVLMAgent:
             # Breakaway torque: If motion is required, command at least 2 degrees
             # so the servo overcomes static gearbox friction rather than humming
             deg_x = max(2, raw_deg_x)
-            dir_x = 1 if self.invert_pan else -1
+            dir_x = -1 if self.invert_pan else 1
             step_pan = dir_x * (deg_x if error_x > 0 else -deg_x)
 
         # Tilt axis calculation
@@ -460,22 +474,11 @@ class VisionVLMAgent:
             step_tilt = dir_y * (deg_y if error_y > 0 else -deg_y)
 
         if step_pan != 0 or step_tilt != 0:
-            pan_cfg = self.config.get("servos", {}).get("pan", {})
-            tilt_cfg = self.config.get("servos", {}).get("tilt", {})
+            target_pan = self.current_pan + step_pan
+            target_tilt = self.current_tilt + step_tilt
 
-            min_p = int(pan_cfg.get("min_angle", 30))
-            max_p = int(pan_cfg.get("max_angle", 150))
-            min_t = int(tilt_cfg.get("min_angle", 50))
-            max_t = int(tilt_cfg.get("max_angle", 100))
-
-            target_pan = max(min_p, min(max_p, self.current_pan + step_pan))
-            target_tilt = max(min_t, min(max_t, self.current_tilt + step_tilt))
-
-            if target_pan != self.current_pan or target_tilt != self.current_tilt:
-                self.current_pan = target_pan
-                self.current_tilt = target_tilt
-                self._last_servo_cmd_time = now
-                self.bus.publish(MoveServoCommand(pan=self.current_pan, tilt=self.current_tilt))
+            self._last_servo_cmd_time = now
+            self.bus.publish(MoveServoCommand(pan=target_pan, tilt=target_tilt))
 
     def get_latest_processed_frame(self):
         """Read-only display renderer for the MJPEG diagnostic stream."""

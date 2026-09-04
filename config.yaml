@@ -49,8 +49,8 @@ servos:
 
   pan:
     channel: 0
-    min_angle: 10
-    max_angle: 170
+    min_angle: 0
+    max_angle: 180
     base_angle: 90
     invert: false
 
@@ -58,7 +58,7 @@ servos:
     channel: 1
     min_angle: 50
     max_angle: 100
-    base_angle: 70
+    base_angle: 90
     invert: false
 
   # Minimum 8% deadband to stop oscillations around target center

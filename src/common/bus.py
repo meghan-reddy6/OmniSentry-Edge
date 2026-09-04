@@ -68,6 +68,9 @@ class EventBus:
                     else:
                         asyncio.create_task(handler(event))
                 else:
-                    handler(event)
+                    if self._loop and self._loop.is_running():
+                        self._loop.run_in_executor(None, handler, event)
+                    else:
+                        handler(event)
             except Exception as e:
                 logger.error(f"[EventBus] Error dispatching {event_name} to {handler.__name__}: {e}", exc_info=True)

@@ -112,7 +112,8 @@ class AudioSensingAgent:
 
                     speed_of_sound = 343.0
                     tau = shift / float(self.sample_rate)
-                    val = (tau * speed_of_sound) / self.mic_distance
+                    safe_mic_dist = max(0.001, float(getattr(self, "mic_distance", 0.065)))
+                    val = (tau * speed_of_sound) / safe_mic_dist
                     val = max(-1.0, min(1.0, val))
                     est_angle = math.degrees(math.asin(val))
 
