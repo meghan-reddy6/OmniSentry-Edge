@@ -5,7 +5,7 @@ echo "=========================================================="
 echo "  OmniSentry-Edge: Rubik Pi 3 Auto-Setup (Qualcomm NPU)   "
 echo "=========================================================="
 
-sudo apt update
+sudo apt update || true
 sudo apt install -y git git-lfs python3-pip python3-venv portaudio19-dev libasound2-dev python3-smbus qnn-tools snpe-tools wget i2c-tools || true
 sudo usermod -aG i2c,video,audio $USER || true
 
