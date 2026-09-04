@@ -411,11 +411,11 @@ class VisionVLMAgent:
             return
 
         now = time.time()
-        # Ensure a minimum 75ms window between motor writes so the servo physically
+        # Ensure a minimum 50ms window between motor writes so the servo physically
         # completes its travel before receiving the next target pulse
         if not hasattr(self, "_last_servo_cmd_time"):
             self._last_servo_cmd_time = 0.0
-        if (now - self._last_servo_cmd_time) < 0.075:
+        if (now - self._last_servo_cmd_time) < 0.050:
             return
 
         matched_box = self._select_locked_target(self._latest_detections, self.current_prompt)
@@ -426,7 +426,7 @@ class VisionVLMAgent:
             if self.smooth_box is None:
                 self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
             else:
-                self.smooth_box = 0.15 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.85 * self.smooth_box
+                self.smooth_box = 0.25 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.75 * self.smooth_box
 
             sx, sy, sw, sh = [int(v) for v in self.smooth_box]
             self.locked_target_bbox = [sx, sy, sw, sh]
@@ -461,9 +461,9 @@ class VisionVLMAgent:
         if abs(error_x) > deadband:
             effective_err_x = abs(error_x) - deadband
             raw_deg_x = int(round(effective_err_x * 4.0))
-            # Breakaway torque: If motion is required, command at least 2 degrees
+            # Breakaway torque: If motion is required, command at least 1 degree
             # so the servo overcomes static gearbox friction rather than humming
-            deg_x = max(2, raw_deg_x)
+            deg_x = min(4, max(1, raw_deg_x))
             dir_x = -1 if self.invert_pan else 1
             step_pan = dir_x * (deg_x if error_x > 0 else -deg_x)
 
@@ -471,13 +471,16 @@ class VisionVLMAgent:
         if abs(error_y) > deadband:
             effective_err_y = abs(error_y) - deadband
             raw_deg_y = int(round(effective_err_y * 3.0))
-            deg_y = max(2, raw_deg_y)
+            deg_y = min(3, max(1, raw_deg_y))
             dir_y = 1 if self.invert_tilt else -1
             step_tilt = dir_y * (deg_y if error_y > 0 else -deg_y)
 
         if step_pan != 0 or step_tilt != 0:
             target_pan = self.current_pan + step_pan
             target_tilt = self.current_tilt + step_tilt
+
+            self.current_pan = target_pan
+            self.current_tilt = target_tilt
 
             self._last_servo_cmd_time = now
             self.bus.publish(MoveServoCommand(pan=target_pan, tilt=target_tilt))
