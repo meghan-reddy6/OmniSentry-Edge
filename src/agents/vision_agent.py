@@ -207,7 +207,7 @@ class VisionVLMAgent:
         self.deadband = float(servo_cfg.get("deadband", 0.05))
 
         self.prompt_supported = True
-        self._inference_buffer = np.empty((self.frame_height, self.frame_width, 3), dtype=np.uint8)
+        self._inference_buffer = None
 
         # NPU / QNN Session Initialization
         REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -297,6 +297,8 @@ class VisionVLMAgent:
 
             with self._frame_lock:
                 if self._raw_frame is not None:
+                    if self._inference_buffer is None or self._inference_buffer.shape != self._raw_frame.shape:
+                        self._inference_buffer = np.empty_like(self._raw_frame)
                     np.copyto(self._inference_buffer, self._raw_frame)
                     has_frame = True
 
