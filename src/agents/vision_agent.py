@@ -417,8 +417,10 @@ class VisionVLMAgent:
             return
 
         now = time.time()
-        # Enforce 60ms settle window to prevent PCA9685 pulse saturation and H-bridge stalling
-        if (now - self._last_servo_cmd_time) < 0.060:
+        # Enforce 50ms minimum settle time between I2C servo updates
+        if not hasattr(self, "_last_servo_cmd_time"):
+            self._last_servo_cmd_time = 0.0
+        if (now - self._last_servo_cmd_time) < 0.050:
             return
 
         matched_box = self._select_locked_target(self._latest_detections, self.current_prompt)
@@ -434,11 +436,11 @@ class VisionVLMAgent:
         self.lock_lost_timestamp = None
         bx, by, bw, bh = matched_box
 
-        # Discard corrupted or edge-clipped boxes that trigger false error vectors at boundaries
+        # Discard corrupted or frame-border clipped boxes
         if bw < 10 or bh < 10 or bx <= 2 or (bx + bw) >= (w - 2):
             return
 
-        # Low-pass EMA smoothing
+        # Low-pass EMA filter on bounding box
         if self.smooth_box is None:
             self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
         else:
@@ -462,25 +464,28 @@ class VisionVLMAgent:
         step_pan = 0
         step_tilt = 0
 
-        # PAN AXIS: Breakaway torque scaling below 45° to overcome cable drag & static friction
+        # PAN AXIS:
+        # Ground truth: Angle Increase -> Pan Left; Angle Decrease -> Pan Right.
+        # When error_x < 0 (target on camera LEFT), we must INCREASE angle (+step).
+        # When error_x > 0 (target on camera RIGHT), we must DECREASE angle (-step).
         if abs(error_x) > deadband:
-            excess = abs(error_x) - deadband
-            if self.confirmed_pan < 45 or self.confirmed_pan > 135:
-                # 3° minimum step to overcome static friction near mechanical limits
-                deg_x = max(3, min(7, int(round(excess * 6.0))))
-            else:
-                deg_x = max(2, min(5, int(round(excess * 4.5))))
-
-            if self.invert_pan:
+            excess_x = abs(error_x) - deadband
+            # Dynamic step sizing with minimum 2° breakaway torque
+            deg_x = max(2, min(5, int(round(excess_x * 5.0))))
+            
+            if not self.invert_pan:
                 step_pan = -deg_x if error_x > 0 else deg_x
             else:
                 step_pan = deg_x if error_x > 0 else -deg_x
 
-        # TILT AXIS
+        # TILT AXIS:
+        # When error_y < 0 (target above center), tilt UP.
+        # When error_y > 0 (target below center), tilt DOWN.
         if abs(error_y) > deadband:
             excess_y = abs(error_y) - deadband
-            deg_y = max(2, min(4, int(round(excess_y * 3.5))))
-            if self.invert_tilt:
+            deg_y = max(2, min(4, int(round(excess_y * 4.0))))
+            
+            if not self.invert_tilt:
                 step_tilt = -deg_y if error_y > 0 else deg_y
             else:
                 step_tilt = deg_y if error_y > 0 else -deg_y
@@ -489,20 +494,21 @@ class VisionVLMAgent:
             pan_cfg = self.config.get("servos", {}).get("pan", {})
             tilt_cfg = self.config.get("servos", {}).get("tilt", {})
 
-            min_p = int(pan_cfg.get("min_angle", 15))
-            max_p = int(pan_cfg.get("max_angle", 165))
-            min_t = int(tilt_cfg.get("min_angle", 45))
-            max_t = int(tilt_cfg.get("max_angle", 110))
+            min_p = int(pan_cfg.get("min_angle", 20))
+            max_p = int(pan_cfg.get("max_angle", 160))
+            min_t = int(tilt_cfg.get("min_angle", 50))
+            max_t = int(tilt_cfg.get("max_angle", 105))
 
+            # Reference target strictly from current confirmed hardware state
             target_pan = max(min_p, min(max_p, self.confirmed_pan + step_pan))
             target_tilt = max(min_t, min(max_t, self.confirmed_tilt + step_tilt))
-            
-            logger.info(f"[VisionTracking] err_x: {error_x:.3f}, err_y: {error_y:.3f} | step_p: {step_pan}°, step_t: {step_tilt}° | target_p: {target_pan}°, target_t: {target_tilt}° | current_confirmed_p: {self.confirmed_pan}°")
 
             if target_pan != self.confirmed_pan or target_tilt != self.confirmed_tilt:
                 self._last_servo_cmd_time = now
                 self.confirmed_pan = target_pan
                 self.confirmed_tilt = target_tilt
+                self.current_pan = target_pan
+                self.current_tilt = target_tilt
                 from src.common.bus import MoveServoCommand
                 self.bus.publish(MoveServoCommand(pan=target_pan, tilt=target_tilt))
 
