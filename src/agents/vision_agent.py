@@ -681,4 +681,11 @@ class VisionVLMAgent:
             self._cam_thread.join(timeout=1.0)
         if self._infer_thread and self._infer_thread.is_alive():
             self._infer_thread.join(timeout=1.0)
+            
+        if hasattr(self, '_session') and self._session is not None:
+            # Explicitly delete the ONNX Runtime session so the QNN C++ 
+            # execution provider cleans up the hexagon graph safely before exit.
+            del self._session
+            self._session = None
+            
         logger.info("[VisionAgent]: Vision agent stopped.")
