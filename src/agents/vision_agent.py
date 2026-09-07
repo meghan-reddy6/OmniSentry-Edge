@@ -208,6 +208,9 @@ class VisionVLMAgent:
         self.virtual_tilt = float(tilt_cfg.get("base_angle", 75.0))
         self.last_dispatched_pan = int(round(self.virtual_pan))
         self.last_dispatched_tilt = int(round(self.virtual_tilt))
+        
+        self.current_pan = self.last_dispatched_pan
+        self.current_tilt = self.last_dispatched_tilt
 
         # PD parameters and pacing
         self.kp_pan = float(track_cfg.get("kp_pan", 4.8))
