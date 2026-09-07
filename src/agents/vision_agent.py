@@ -266,6 +266,7 @@ class VisionVLMAgent:
         self._infer_thread = None
         self._cam_thread = None
         self._latest_annotated_frame = None
+        self._annotated_jpeg = None
         # Event Bus Wireup
         if hasattr(self.bus, 'subscribe'):
             self.bus.subscribe("TrackCommand", self.handle_track_command)
@@ -323,9 +324,18 @@ class VisionVLMAgent:
             annotated = frame.copy()
             self._render_annotations_in_place(annotated)
             
+            # Encode frame to JPEG
+            ret_encode, buffer = cv2.imencode('.jpg', annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            jpeg_bytes = buffer.tobytes() if ret_encode else None
+            
             with self._frame_lock:
                 self._raw_frame = frame
                 self._latest_annotated_frame = annotated
+                self._annotated_jpeg = jpeg_bytes
+                
+            # Run closed-loop servo stepping at camera frame rate (or throttled by update_interval)
+            h, w = frame.shape[:2]
+            self._process_servo_tracking_step(w, h)
 
         if self._cap:
             self._cap.release()
@@ -371,9 +381,6 @@ class VisionVLMAgent:
                 self._latest_detections = [
                     (b, c, cid, lbl) for b, c, cid, lbl in zip(boxes, confs, classes, labels)
                 ]
-
-                # Run closed-loop servo stepping strictly from the NPU thread (15-20 Hz max)
-                self._process_servo_tracking_step(w, h)
 
             except Exception as e:
                 logger.error(f"[VisionAgent]: Inference error: {e}")
@@ -568,6 +575,11 @@ class VisionVLMAgent:
                 from src.common.bus import MoveServoCommand
                 self.bus.publish(MoveServoCommand(pan=cmd_pan, tilt=cmd_tilt))
 
+    def get_latest_jpeg(self):
+        """Returns the pre-encoded JPEG bytes for streaming."""
+        with self._frame_lock:
+            return self._annotated_jpeg
+
     def get_annotated_frame(self):
         """Returns the latest OpenCV frame with tracking reticles for web streaming."""
         with self._frame_lock:
@@ -649,6 +661,7 @@ class VisionVLMAgent:
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
         self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         logger.info(f"[VisionAgent]: Camera hardware engaged at {self.frame_width}x{self.frame_height} @ {self.target_fps} FPS.")
 

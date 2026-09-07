@@ -317,13 +317,10 @@ def generate_frames():
     """Generator that yields MJPEG frames from the VisionVLMAgent."""
     while True:
         if _vision_agent:
-            frame = _vision_agent.get_annotated_frame()
-            if frame is not None:
-                ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                if ret:
-                    frame_bytes = buffer.tobytes()
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            jpeg_bytes = _vision_agent.get_latest_jpeg()
+            if jpeg_bytes is not None:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
         time.sleep(1.0 / 30.0)
 
 @app.get("/video_feed")
