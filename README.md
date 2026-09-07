@@ -82,17 +82,24 @@ chmod +x setup_rubikpi.sh scripts/compile_qnn_ctx.py
 ### 3. Launching the Stack
 ```bash
 source venv/bin/activate
+# Standard Dual-Mode (Starts Web Dashboard on port 8080 and keeps terminal quiet)
 python src/main.py
+
+# Headless CLI Mode (No web dashboard, interactive terminal only)
+python src/main.py --headless
+
+# Debug Mode (Streams verbose logs to stdout)
+python src/main.py --debug
 ```
 
-### 4. Live Diagnostics Dashboard
+### 4. Live Web CLI Dashboard
 Open your web browser and navigate to:
 ```text
 http://<RUBIKPI_IP>:8080/
 ```
-The dashboard streams an annotated 30 FPS video feed showing target lock corner brackets, Center-of-Vision error vectors, and live audio/gimbal telemetry.
+The premium dashboard provides a real-time MJPEG tracking feed and a WebSocket-powered terminal to issue commands directly to the EventBus.
 
-## 🎮 Interactive CLI Commands
+## 🎮 Interactive Commands (Web or Terminal)
 
 | Command | Action | Example |
 | :--- | :--- | :--- |

@@ -549,8 +549,18 @@ class VisionVLMAgent:
                 self.last_dispatched_pan = cmd_pan
                 self.last_dispatched_tilt = cmd_tilt
                 self._last_servo_cmd_time = now
+                
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[VisionTracking] err_x:{error_x:.3f}, err_y:{error_y:.3f} | "
+                                 f"pd_x:{delta_pan:.2f}, pd_y:{delta_tilt:.2f} | "
+                                 f"cmd_pan:{cmd_pan}, cmd_tilt:{cmd_tilt}")
+                                 
                 from src.common.bus import MoveServoCommand
                 self.bus.publish(MoveServoCommand(pan=cmd_pan, tilt=cmd_tilt))
+
+    def get_annotated_frame(self):
+        """Returns the latest OpenCV frame with tracking reticles for web streaming."""
+        return self.get_latest_processed_frame()
 
     def get_latest_processed_frame(self):
         """Read-only display renderer for the MJPEG diagnostic stream."""

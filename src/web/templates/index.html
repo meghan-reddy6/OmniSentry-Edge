@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OmniSentry-Edge Dashboard</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --panel-bg: rgba(30, 41, 59, 0.7);
+            --border-color: rgba(255, 255, 255, 0.1);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #38bdf8;
+            --accent-glow: rgba(56, 189, 248, 0.5);
+            --font-mono: 'JetBrains Mono', 'Fira Code', 'Courier New', Courier, monospace;
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: var(--font-sans);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.15) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, rgba(139, 92, 246, 0.15) 0px, transparent 50%);
+        }
+
+        .header {
+            padding: 1.25rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(12px);
+            z-index: 10;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 1.25rem;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: #10b981;
+            box-shadow: 0 0 10px #10b981;
+        }
+
+        .status-indicator.disconnected {
+            background-color: #ef4444;
+            box-shadow: 0 0 10px #ef4444;
+        }
+
+        .main-content {
+            display: flex;
+            flex: 1;
+            padding: 1.5rem;
+            gap: 1.5rem;
+            height: calc(100vh - 73px);
+            box-sizing: border-box;
+        }
+
+        .video-container {
+            flex: 2;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            backdrop-filter: blur(16px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+            position: relative;
+        }
+        
+        .video-container::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            border-radius: 12px;
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+            pointer-events: none;
+            z-index: 2;
+        }
+
+        .video-header {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .video-feed {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background-color: #000;
+            z-index: 1;
+        }
+
+        .cli-container {
+            flex: 1;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            backdrop-filter: blur(16px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+        }
+
+        .cli-header {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .cli-output {
+            flex: 1;
+            padding: 1rem;
+            overflow-y: auto;
+            font-family: var(--font-mono);
+            font-size: 0.9rem;
+            line-height: 1.5;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .log-entry {
+            word-break: break-all;
+        }
+        
+        .log-entry.system {
+            color: var(--text-muted);
+        }
+        
+        .log-entry.user {
+            color: var(--accent);
+        }
+        
+        .log-entry.error {
+            color: #ef4444;
+        }
+
+        .cli-input-wrapper {
+            padding: 1rem;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 0 0 12px 12px;
+        }
+
+        .cli-prompt {
+            color: var(--accent);
+            font-family: var(--font-mono);
+            font-weight: bold;
+        }
+
+        .cli-input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--text-main);
+            font-family: var(--font-mono);
+            font-size: 0.95rem;
+            outline: none;
+        }
+
+        .cli-input::placeholder {
+            color: rgba(148, 163, 184, 0.4);
+        }
+
+        @media (max-width: 1024px) {
+            .main-content {
+                flex-direction: column;
+            }
+            .video-container {
+                min-height: 400px;
+            }
+            .cli-container {
+                min-height: 300px;
+            }
+        }
+    </style>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="header">
+        <h1><div id="status-dot" class="status-indicator disconnected"></div> OmniSentry-Edge</h1>
+        <div style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--text-muted);" id="connection-status">Connecting...</div>
+    </div>
+
+    <div class="main-content">
+        <div class="video-container">
+            <div class="video-header">
+                <span>MJPEG Stream</span>
+                <span>VisionVLMAgent</span>
+            </div>
+            <img id="video_feed" class="video-feed" src="/video_feed" alt="Camera Feed Offline">
+        </div>
+
+        <div class="cli-container">
+            <div class="cli-header">Command Terminal</div>
+            <div class="cli-output" id="cli-output">
+                <div class="log-entry system">Initializing WebSocket connection...</div>
+            </div>
+            <div class="cli-input-wrapper">
+                <span class="cli-prompt">RubikPi></span>
+                <input type="text" class="cli-input" id="cli-input" placeholder="Type 'track cup' or 'home'..." autocomplete="off">
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const cliOutput = document.getElementById('cli-output');
+        const cliInput = document.getElementById('cli-input');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('connection-status');
+        
+        let ws;
+
+        function appendLog(message, type = 'system') {
+            const el = document.createElement('div');
+            el.className = `log-entry ${type}`;
+            el.textContent = message;
+            cliOutput.appendChild(el);
+            cliOutput.scrollTop = cliOutput.scrollHeight;
+        }
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws/cli`;
+            
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                statusDot.classList.remove('disconnected');
+                statusText.textContent = 'Connected';
+                appendLog('WebSocket Connected to EventBus.', 'system');
+            };
+
+            ws.onmessage = (event) => {
+                appendLog(`System: ${event.data}`, 'system');
+            };
+
+            ws.onclose = () => {
+                statusDot.classList.add('disconnected');
+                statusText.textContent = 'Disconnected';
+                appendLog('Connection lost. Reconnecting in 3s...', 'error');
+                setTimeout(connectWebSocket, 3000);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket Error:', error);
+            };
+        }
+
+        cliInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                const cmd = cliInput.value.trim();
+                if (cmd) {
+                    appendLog(`RubikPi> ${cmd}`, 'user');
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(cmd);
+                    } else {
+                        appendLog('Error: Not connected to server.', 'error');
+                    }
+                    cliInput.value = '';
+                }
+            }
+        });
+
+        // Initialize
+        connectWebSocket();
+        
+        // Focus input on load
+        window.onload = () => {
+            cliInput.focus();
+        };
+    </script>
+</body>
+</html>

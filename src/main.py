@@ -23,12 +23,7 @@ from src.agents.audio_agent import AudioSensingAgent
 from src.agents.vision_agent import VisionVLMAgent
 from src.agents.servo_agent import ServoActuatorAgent
 
-# Configure standard formatting for execution output logs
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+# Setup root logger (configured in main() based on args)
 logger = logging.getLogger("main")
 
 async def cli_input_loop(bus: EventBus, config: SystemConfig, shutdown_event: asyncio.Event):
@@ -109,7 +104,7 @@ async def cli_input_loop(bus: EventBus, config: SystemConfig, shutdown_event: as
             logger.error(f"Error in interactive CLI runner: {e}")
             await asyncio.sleep(0.5)
 
-async def main_async(config_path: str):
+async def main_async(config_path: str, headless: bool, port: int):
     logger.info("Initializing RubikPi 3 Audio-Visual Sensing Stack...")
     
     # Load system configurations (falls back to DEFAULT_CONFIG if YAML is missing)
@@ -138,6 +133,22 @@ async def main_async(config_path: str):
         await agent.start()
         
     logger.info("System fully operational. Registering input handlers...")
+    
+    # Start web server if not headless
+    if not headless:
+        import threading
+        import uvicorn
+        from src.web.server import create_app
+        
+        logger.info(f"Starting Web Dashboard on port {port}...")
+        app = create_app(bus, vision, config)
+        
+        def run_uvicorn():
+            # Suppress uvicorn's verbose access logs unless in debug mode
+            uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+            
+        uvicorn_thread = threading.Thread(target=run_uvicorn, daemon=True)
+        uvicorn_thread.start()
     
     # Spawn background interactive console reader
     cli_task = asyncio.create_task(cli_input_loop(bus, config, shutdown_event))
@@ -173,10 +184,29 @@ def main():
     # so execution from inside the src/ folder resolves config.yaml correctly.
     default_config_path = os.path.join(project_root, "config.yaml")
     parser.add_argument("--config", type=str, default=default_config_path, help="Path to config.yaml file")
+    
+    # Dual-mode and dashboard arguments
+    parser.add_argument("--debug", action="store_true", help="Enable verbose stdout streaming")
+    parser.add_argument("--port", type=int, default=8080, help="Web server port (default 8080)")
+    parser.add_argument("--headless", action="store_true", help="Run terminal CLI only without the web dashboard")
+    
     args = parser.parse_args()
     
+    # Configure dynamic logging
+    log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, format=log_format, handlers=[logging.StreamHandler(sys.stdout)])
+    else:
+        # Keep console quiet (WARNING only), route all INFO to file
+        log_file = os.path.join(project_root, "omnisentry.log")
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.WARNING)
+        logging.basicConfig(level=logging.INFO, format=log_format, handlers=[file_handler, console_handler])
+    
     try:
-        asyncio.run(main_async(args.config))
+        asyncio.run(main_async(args.config, args.headless, args.port))
     except KeyboardInterrupt:
         logger.info("System shutdown requested via keyboard interrupt.")
 
