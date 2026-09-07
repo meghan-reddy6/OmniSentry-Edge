@@ -62,14 +62,14 @@ servos:
     invert: false
 
   tracking:
-    deadband_x: 0.05
-    deadband_y: 0.06
-    kp_pan: 4.8
-    kd_pan: 0.42
-    kp_tilt: 3.8
-    kd_tilt: 0.32
+    deadband_x: 0.10
+    deadband_y: 0.10
+    kp_pan: 3.5
+    kd_pan: 0.30
+    kp_tilt: 2.8
+    kd_tilt: 0.25
     max_step_deg: 5.0
-    min_breakaway_deg: 1.8
+    min_breakaway_deg: 1.2
     update_interval_sec: 0.045
 
 orchestrator:

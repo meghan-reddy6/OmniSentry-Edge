@@ -474,7 +474,8 @@ class VisionVLMAgent:
         if self.smooth_box is None:
             self.smooth_box = raw_box
         else:
-            self.smooth_box = 0.35 * raw_box + 0.65 * self.smooth_box
+            # Faster EMA (0.75 weight to new frame) to eliminate trailing phase lag causing hover
+            self.smooth_box = 0.75 * raw_box + 0.25 * self.smooth_box
 
         sx, sy, sw, sh = self.smooth_box
         self.locked_target_bbox = [int(sx), int(sy), int(sw), int(sh)]
