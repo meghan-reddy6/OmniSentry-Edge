@@ -200,6 +200,10 @@ class VisionVLMAgent:
         self.current_pan = self.confirmed_pan
         self.current_tilt = self.confirmed_tilt
 
+        # PD Tracking State
+        self._prev_error_x = 0.0
+        self._prev_error_y = 0.0
+
         # Target Lock Tracking State
         self.is_tracking_active = False
         self.current_prompt = None
@@ -417,11 +421,15 @@ class VisionVLMAgent:
             return
 
         now = time.time()
-        # Enforce 50ms minimum settle time between I2C servo updates
+        # Enforce 100ms settle window (10 Hz). Critical to eliminate hunting and phase lag.
         if not hasattr(self, "_last_servo_cmd_time"):
             self._last_servo_cmd_time = 0.0
-        if (now - self._last_servo_cmd_time) < 0.050:
+        if (now - self._last_servo_cmd_time) < 0.100:
             return
+
+        dt = now - self._last_servo_cmd_time if self._last_servo_cmd_time > 0 else 0.100
+        if dt <= 0.0 or dt > 0.3:
+            dt = 0.100
 
         matched_box = self._select_locked_target(self._latest_detections, self.current_prompt)
         if matched_box is None:
@@ -431,20 +439,22 @@ class VisionVLMAgent:
                 self.locked_target_bbox = None
                 self.current_target_bbox = None
                 self.smooth_box = None
+                self._prev_error_x = 0.0
+                self._prev_error_y = 0.0
             return
 
         self.lock_lost_timestamp = None
         bx, by, bw, bh = matched_box
 
-        # Discard corrupted or frame-border clipped boxes
-        if bw < 10 or bh < 10 or bx <= 2 or (bx + bw) >= (w - 2):
+        # Discard corrupted or extreme edge-boundary boxes
+        if bw < 15 or bh < 15 or bx <= 2 or (bx + bw) >= (w - 2):
             return
 
-        # Low-pass EMA filter on bounding box
+        # Heavy EMA filter to stabilize bounding box noise
         if self.smooth_box is None:
             self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
         else:
-            self.smooth_box = 0.30 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.70 * self.smooth_box
+            self.smooth_box = 0.25 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.75 * self.smooth_box
 
         sx, sy, sw, sh = [int(v) for v in self.smooth_box]
         self.locked_target_bbox = [sx, sy, sw, sh]
@@ -459,47 +469,46 @@ class VisionVLMAgent:
         error_x = (target_cx - cx_frame) / denom_x
         error_y = (target_cy - cy_frame) / denom_y
 
-        deadband = float(self.config.get("servos", {}).get("deadband", 0.06))
+        deadband = float(self.config.get("servos", {}).get("deadband", 0.10))
 
         step_pan = 0
         step_tilt = 0
 
-        # PAN AXIS:
-        # Ground truth: Angle Increase -> Pan Left; Angle Decrease -> Pan Right.
-        # When error_x < 0 (target on camera LEFT), we must INCREASE angle (+step).
-        # When error_x > 0 (target on camera RIGHT), we must DECREASE angle (-step).
+        # --- PAN AXIS (PD Controller with Velocity Braking) ---
         if abs(error_x) > deadband:
-            excess_x = abs(error_x) - deadband
-            # Dynamic step sizing with minimum 2° breakaway torque
-            deg_x = max(2, min(5, int(round(excess_x * 5.0))))
+            derivative_x = (error_x - self._prev_error_x) / dt
+            # Kp = 3.5, Kd = 0.35
+            pd_output_x = (3.5 * error_x) + (0.35 * derivative_x)
             
-            if not self.invert_pan:
-                step_pan = -deg_x if error_x > 0 else deg_x
-            else:
-                step_pan = deg_x if error_x > 0 else -deg_x
+            # Clamp step magnitude to prevent violent whips
+            deg_x = min(4.0, max(-4.0, pd_output_x))
+            
+            # Minimum 1.5° breakaway if moving, otherwise 0
+            if abs(deg_x) >= 1.0:
+                # Based on verified hardware: Target Left (error_x < 0) -> Increase Pan Angle
+                step_pan = int(round(-deg_x if not self.invert_pan else deg_x))
+        self._prev_error_x = error_x
 
-        # TILT AXIS:
-        # When error_y < 0 (target above center), tilt UP.
-        # When error_y > 0 (target below center), tilt DOWN.
+        # --- TILT AXIS (PD Controller with Velocity Braking) ---
         if abs(error_y) > deadband:
-            excess_y = abs(error_y) - deadband
-            deg_y = max(2, min(4, int(round(excess_y * 4.0))))
+            derivative_y = (error_y - self._prev_error_y) / dt
+            # Kp = 3.0, Kd = 0.25
+            pd_output_y = (3.0 * error_y) + (0.25 * derivative_y)
+            deg_y = min(3.0, max(-3.0, pd_output_y))
             
-            if not self.invert_tilt:
-                step_tilt = -deg_y if error_y > 0 else deg_y
-            else:
-                step_tilt = deg_y if error_y > 0 else -deg_y
+            if abs(deg_y) >= 1.0:
+                step_tilt = int(round(-deg_y if not self.invert_tilt else deg_y))
+        self._prev_error_y = error_y
 
         if step_pan != 0 or step_tilt != 0:
             pan_cfg = self.config.get("servos", {}).get("pan", {})
             tilt_cfg = self.config.get("servos", {}).get("tilt", {})
 
-            min_p = int(pan_cfg.get("min_angle", 20))
-            max_p = int(pan_cfg.get("max_angle", 160))
-            min_t = int(tilt_cfg.get("min_angle", 50))
-            max_t = int(tilt_cfg.get("max_angle", 105))
+            min_p = int(pan_cfg.get("min_angle", 25))
+            max_p = int(pan_cfg.get("max_angle", 155))
+            min_t = int(tilt_cfg.get("min_angle", 55))
+            max_t = int(tilt_cfg.get("max_angle", 100))  # Hardware safety ceiling to prevent binding
 
-            # Reference target strictly from current confirmed hardware state
             target_pan = max(min_p, min(max_p, self.confirmed_pan + step_pan))
             target_tilt = max(min_t, min(max_t, self.confirmed_tilt + step_tilt))
 
