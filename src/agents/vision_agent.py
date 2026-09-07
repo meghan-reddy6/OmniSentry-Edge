@@ -194,6 +194,19 @@ class VisionVLMAgent:
         self.invert_pan = servo_cfg.get("pan", {}).get("invert", False)
         self.invert_tilt = servo_cfg.get("tilt", {}).get("invert", True)
 
+        pid_cfg = servo_cfg.get("pid", {})
+        self.kp_pan = float(pid_cfg.get("kp_pan", 6.5))
+        self.kd_pan = float(pid_cfg.get("kd_pan", 1.2))
+        self.kp_tilt = float(pid_cfg.get("kp_tilt", 4.8))
+        self.kd_tilt = float(pid_cfg.get("kd_tilt", 0.9))
+        self.deadband = float(pid_cfg.get("deadband", 0.025))
+        self.max_step = float(pid_cfg.get("max_step_deg", 6.0))
+
+        # PID Error Memory & Timers
+        self._prev_error_x = 0.0
+        self._prev_error_y = 0.0
+        self._last_pid_time = time.time()
+
         self.current_pan = self.pan_base
         self.current_tilt = self.tilt_base
 
@@ -204,7 +217,6 @@ class VisionVLMAgent:
         self.smooth_box = None
         self.lock_lost_timestamp = None
         self.lock_grace_period_sec = 1.0     # Hold position for 1.0s if detection drops
-        self.deadband = float(servo_cfg.get("deadband", 0.05))
 
         self.prompt_supported = True
         self._inference_buffer = None
@@ -406,6 +418,47 @@ class VisionVLMAgent:
         matching_boxes.sort(key=lambda x: x[1], reverse=True)
         return matching_boxes[0][0]
 
+    def compute_pid_steps(self, error_x: float, error_y: float):
+        """Calculates fast, anti-overshoot angular adjustments."""
+        now = time.time()
+        dt = max(0.001, now - self._last_pid_time)
+        self._last_pid_time = now
+
+        step_pan = 0.0
+        step_tilt = 0.0
+
+        # --- Pan Axis (Horizontal) ---
+        if abs(error_x) > self.deadband:
+            # Derivative calculation
+            deriv_x = (error_x - self._prev_error_x) / dt
+            # Dynamic velocity scaling: speed increases with distance
+            boost_x = 1.0 + abs(error_x) * 1.5
+            p_term = error_x * self.kp_pan * boost_x
+            d_term = deriv_x * self.kd_pan
+
+            direction_x = 1.0 if self.invert_pan else -1.0
+            step_pan = direction_x * (p_term + d_term) * dt * 30.0
+            step_pan = max(-self.max_step, min(self.max_step, step_pan))
+            self._prev_error_x = error_x
+        else:
+            self._prev_error_x = 0.0
+
+        # --- Tilt Axis (Vertical) ---
+        if abs(error_y) > self.deadband:
+            deriv_y = (error_y - self._prev_error_y) / dt
+            boost_y = 1.0 + abs(error_y) * 1.2
+            p_term = error_y * self.kp_tilt * boost_y
+            d_term = deriv_y * self.kd_tilt
+
+            direction_y = 1.0 if self.invert_tilt else -1.0
+            step_tilt = direction_y * (p_term + d_term) * dt * 30.0
+            step_tilt = max(-self.max_step, min(self.max_step, step_tilt))
+            self._prev_error_y = error_y
+        else:
+            self._prev_error_y = 0.0
+
+        return step_pan, step_tilt
+
     def _process_servo_tracking_step(self, w, h):
         if not self.is_tracking_active or not self.current_prompt:
             return
@@ -452,30 +505,9 @@ class VisionVLMAgent:
         error_x = (target_cx - cx_frame) / denom_x
         error_y = (target_cy - cy_frame) / denom_y
 
-        deadband = float(self.config.get("servos", {}).get("deadband", 0.08))
+        step_pan, step_tilt = self.compute_pid_steps(error_x, error_y)
 
-        step_pan = 0
-        step_tilt = 0
-
-        # Pan axis calculation
-        if abs(error_x) > deadband:
-            effective_err_x = abs(error_x) - deadband
-            raw_deg_x = int(round(effective_err_x * 4.0))
-            # Breakaway torque: If motion is required, command at least 1 degree
-            # so the servo overcomes static gearbox friction rather than humming
-            deg_x = min(4, max(1, raw_deg_x))
-            dir_x = -1 if self.invert_pan else 1
-            step_pan = dir_x * (deg_x if error_x > 0 else -deg_x)
-
-        # Tilt axis calculation
-        if abs(error_y) > deadband:
-            effective_err_y = abs(error_y) - deadband
-            raw_deg_y = int(round(effective_err_y * 3.0))
-            deg_y = min(3, max(1, raw_deg_y))
-            dir_y = 1 if self.invert_tilt else -1
-            step_tilt = dir_y * (deg_y if error_y > 0 else -deg_y)
-
-        if step_pan != 0 or step_tilt != 0:
+        if step_pan != 0.0 or step_tilt != 0.0:
             target_pan = self.current_pan + step_pan
             target_tilt = self.current_tilt + step_tilt
 
