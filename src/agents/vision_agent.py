@@ -240,10 +240,7 @@ class VisionVLMAgent:
         # Event Bus Wireup
         if hasattr(self.bus, 'subscribe'):
             self.bus.subscribe("TrackCommand", self.handle_track_command)
-            self.bus.subscribe("StateChangeEvent", self.handle_state_change)
             self.bus.subscribe("ServoTargetReachedEvent", self._on_servo_target_reached)
-            self.bus.subscribe("SoundLocalizedEvent", self.handle_sound_event)
-            self.bus.subscribe("AudioTelemetryEvent", self.handle_audio_telemetry)
 
         self._last_servo_cmd_time = 0.0
 
