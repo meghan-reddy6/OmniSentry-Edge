@@ -49,19 +49,28 @@ servos:
 
   pan:
     channel: 0
-    min_angle: 25
-    max_angle: 155
+    min_angle: 5
+    max_angle: 175
     base_angle: 90
     invert: false
 
   tilt:
     channel: 1
-    min_angle: 55
-    max_angle: 100
+    min_angle: 45
+    max_angle: 125
     base_angle: 75
     invert: false
 
-  deadband: 0.10
+  tracking:
+    deadband_x: 0.05
+    deadband_y: 0.06
+    kp_pan: 4.8
+    kd_pan: 0.42
+    kp_tilt: 3.8
+    kd_tilt: 0.32
+    max_step_deg: 5.0
+    min_breakaway_deg: 1.8
+    update_interval_sec: 0.045
 
 orchestrator:
   auto_track_speaker: false

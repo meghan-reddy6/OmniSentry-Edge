@@ -189,26 +189,47 @@ class VisionVLMAgent:
         self.infer_throttle_sec = 1.0 / trk_cfg.get("inference_fps_limit", 20)
 
         # Servo Configuration
-        self.pan_base = int(round(servo_cfg.get("pan", {}).get("base_angle", 90)))
-        self.tilt_base = int(round(servo_cfg.get("tilt", {}).get("base_angle", 70)))
-        self.invert_pan = servo_cfg.get("pan", {}).get("invert", False)
-        self.invert_tilt = servo_cfg.get("tilt", {}).get("invert", True)
+        servos_cfg = self.config.get("servos", {})
+        track_cfg = servos_cfg.get("tracking", {})
 
-        # State tracking anchored to confirmed hardware values
-        self.confirmed_pan = int(self.config.get("servos", {}).get("pan", {}).get("base_angle", 90))
-        self.confirmed_tilt = int(self.config.get("servos", {}).get("tilt", {}).get("base_angle", 70))
-        self.current_pan = self.confirmed_pan
-        self.current_tilt = self.confirmed_tilt
+        # Axis physical limits & inversion
+        pan_cfg = servos_cfg.get("pan", {})
+        tilt_cfg = servos_cfg.get("tilt", {})
+        self.pan_min = float(pan_cfg.get("min_angle", 5))
+        self.pan_max = float(pan_cfg.get("max_angle", 175))
+        self.tilt_min = float(tilt_cfg.get("min_angle", 45))
+        self.tilt_max = float(tilt_cfg.get("max_angle", 125))
 
-        # PD Tracking State
+        self.invert_pan = bool(pan_cfg.get("invert", False))
+        self.invert_tilt = bool(tilt_cfg.get("invert", False))
+
+        # Floating-point internal state for sub-degree tracking resolution
+        self.virtual_pan = float(pan_cfg.get("base_angle", 90.0))
+        self.virtual_tilt = float(tilt_cfg.get("base_angle", 75.0))
+        self.last_dispatched_pan = int(round(self.virtual_pan))
+        self.last_dispatched_tilt = int(round(self.virtual_tilt))
+
+        # PD parameters and pacing
+        self.kp_pan = float(track_cfg.get("kp_pan", 4.8))
+        self.kd_pan = float(track_cfg.get("kd_pan", 0.42))
+        self.kp_tilt = float(track_cfg.get("kp_tilt", 3.8))
+        self.kd_tilt = float(track_cfg.get("kd_tilt", 0.32))
+        self.deadband_x = float(track_cfg.get("deadband_x", 0.05))
+        self.deadband_y = float(track_cfg.get("deadband_y", 0.06))
+        self.max_step_deg = float(track_cfg.get("max_step_deg", 5.0))
+        self.min_breakaway = float(track_cfg.get("min_breakaway_deg", 1.8))
+        self.update_interval = float(track_cfg.get("update_interval_sec", 0.045))
+
+        # Loop state
         self._prev_error_x = 0.0
         self._prev_error_y = 0.0
+        self._last_servo_cmd_time = 0.0
+        self.smooth_box = None
 
         # Target Lock Tracking State
         self.is_tracking_active = False
         self.current_prompt = None
         self.locked_target_bbox = None       # [x, y, w, h]
-        self.smooth_box = None
         self.lock_lost_timestamp = None
         self.lock_grace_period_sec = 1.0     # Hold position for 1.0s if detection drops
 
@@ -421,15 +442,13 @@ class VisionVLMAgent:
             return
 
         now = time.time()
-        # Enforce 100ms settle window (10 Hz). Critical to eliminate hunting and phase lag.
-        if not hasattr(self, "_last_servo_cmd_time"):
-            self._last_servo_cmd_time = 0.0
-        if (now - self._last_servo_cmd_time) < 0.100:
+        # Enforce exact physical pacing window (45ms)
+        if (now - self._last_servo_cmd_time) < self.update_interval:
             return
 
-        dt = now - self._last_servo_cmd_time if self._last_servo_cmd_time > 0 else 0.100
-        if dt <= 0.0 or dt > 0.3:
-            dt = 0.100
+        dt = now - self._last_servo_cmd_time if self._last_servo_cmd_time > 0 else self.update_interval
+        if dt <= 0.0 or dt > 0.25:
+            dt = self.update_interval
 
         matched_box = self._select_locked_target(self._latest_detections, self.current_prompt)
         if matched_box is None:
@@ -446,80 +465,91 @@ class VisionVLMAgent:
         self.lock_lost_timestamp = None
         bx, by, bw, bh = matched_box
 
-        # Discard corrupted or extreme edge-boundary boxes
-        if bw < 15 or bh < 15 or bx <= 2 or (bx + bw) >= (w - 2):
+        # Discard degenerate bounding boxes
+        if bw < 12 or bh < 12:
             return
 
-        # Heavy EMA filter to stabilize bounding box noise
+        # Continuous Exponential Moving Average (EMA) on detection coordinates
+        raw_box = np.array([bx, by, bw, bh], dtype=np.float32)
         if self.smooth_box is None:
-            self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
+            self.smooth_box = raw_box
         else:
-            self.smooth_box = 0.25 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.75 * self.smooth_box
+            self.smooth_box = 0.35 * raw_box + 0.65 * self.smooth_box
 
-        sx, sy, sw, sh = [int(v) for v in self.smooth_box]
-        self.locked_target_bbox = [sx, sy, sw, sh]
-        self.current_target_bbox = (sx, sy, sw, sh)
+        sx, sy, sw, sh = self.smooth_box
+        self.locked_target_bbox = [int(sx), int(sy), int(sw), int(sh)]
+        self.current_target_bbox = tuple(self.locked_target_bbox)
 
-        cx_frame, cy_frame = w // 2, h // 2
-        target_cx = sx + sw // 2
-        target_cy = sy + sh // 2
+        cx_frame, cy_frame = w / 2.0, h / 2.0
+        target_cx = sx + (sw / 2.0)
+        target_cy = sy + (sh / 2.0)
 
-        denom_x = max(1.0, float(cx_frame))
-        denom_y = max(1.0, float(cy_frame))
-        error_x = (target_cx - cx_frame) / denom_x
-        error_y = (target_cy - cy_frame) / denom_y
+        # Normalized screen error in [-1.0, 1.0]
+        error_x = (target_cx - cx_frame) / max(1.0, cx_frame)
+        error_y = (target_cy - cy_frame) / max(1.0, cy_frame)
 
-        deadband = float(self.config.get("servos", {}).get("deadband", 0.10))
+        delta_pan = 0.0
+        delta_tilt = 0.0
 
-        step_pan = 0
-        step_tilt = 0
+        # --- PAN CONTROLLER ---
+        if abs(error_x) > self.deadband_x:
+            d_err_x = (error_x - self._prev_error_x) / dt
+            pd_out_x = (self.kp_pan * error_x) + (self.kd_pan * d_err_x)
 
-        # --- PAN AXIS (PD Controller with Velocity Braking) ---
-        if abs(error_x) > deadband:
-            derivative_x = (error_x - self._prev_error_x) / dt
-            # Kp = 3.5, Kd = 0.35
-            pd_output_x = (3.5 * error_x) + (0.35 * derivative_x)
-            
-            # Clamp step magnitude to prevent violent whips
-            deg_x = min(4.0, max(-4.0, pd_output_x))
-            
-            # Minimum 1.5° breakaway if moving, otherwise 0
-            if abs(deg_x) >= 1.0:
-                # Based on verified hardware: Target Left (error_x < 0) -> Increase Pan Angle
-                step_pan = int(round(-deg_x if not self.invert_pan else deg_x))
+            # Cap maximum angular step per update
+            clamped_mag_x = min(self.max_step_deg, abs(pd_out_x))
+
+            # Breakaway torque floor to eliminate stalling at extreme angles
+            if clamped_mag_x < self.min_breakaway:
+                clamped_mag_x = self.min_breakaway
+
+            # Direction Mapping:
+            # error_x < 0 (target on camera left) -> Increase pan angle (+step)
+            # error_x > 0 (target on camera right) -> Decrease pan angle (-step)
+            sign_x = -1.0 if error_x > 0 else 1.0
+            if self.invert_pan:
+                sign_x = -sign_x
+            delta_pan = sign_x * clamped_mag_x
+        else:
+            self._prev_error_x = error_x
+
         self._prev_error_x = error_x
 
-        # --- TILT AXIS (PD Controller with Velocity Braking) ---
-        if abs(error_y) > deadband:
-            derivative_y = (error_y - self._prev_error_y) / dt
-            # Kp = 3.0, Kd = 0.25
-            pd_output_y = (3.0 * error_y) + (0.25 * derivative_y)
-            deg_y = min(3.0, max(-3.0, pd_output_y))
-            
-            if abs(deg_y) >= 1.0:
-                step_tilt = int(round(-deg_y if not self.invert_tilt else deg_y))
+        # --- TILT CONTROLLER ---
+        if abs(error_y) > self.deadband_y:
+            d_err_y = (error_y - self._prev_error_y) / dt
+            pd_out_y = (self.kp_tilt * error_y) + (self.kd_tilt * d_err_y)
+
+            clamped_mag_y = min(self.max_step_deg, abs(pd_out_y))
+            if clamped_mag_y < self.min_breakaway:
+                clamped_mag_y = self.min_breakaway
+
+            # error_y > 0 (target low in frame) -> tilt down (decrease angle)
+            # error_y < 0 (target high in frame) -> tilt up (increase angle)
+            sign_y = -1.0 if error_y > 0 else 1.0
+            if self.invert_tilt:
+                sign_y = -sign_y
+            delta_tilt = sign_y * clamped_mag_y
+        else:
+            self._prev_error_y = error_y
+
         self._prev_error_y = error_y
 
-        if step_pan != 0 or step_tilt != 0:
-            pan_cfg = self.config.get("servos", {}).get("pan", {})
-            tilt_cfg = self.config.get("servos", {}).get("tilt", {})
+        # Integrate and clamp in high-precision float space
+        if delta_pan != 0.0 or delta_tilt != 0.0:
+            self.virtual_pan = max(self.pan_min, min(self.pan_max, self.virtual_pan + delta_pan))
+            self.virtual_tilt = max(self.tilt_min, min(self.tilt_max, self.virtual_tilt + delta_tilt))
 
-            min_p = int(pan_cfg.get("min_angle", 25))
-            max_p = int(pan_cfg.get("max_angle", 155))
-            min_t = int(tilt_cfg.get("min_angle", 55))
-            max_t = int(tilt_cfg.get("max_angle", 100))  # Hardware safety ceiling to prevent binding
+            cmd_pan = int(round(self.virtual_pan))
+            cmd_tilt = int(round(self.virtual_tilt))
 
-            target_pan = max(min_p, min(max_p, self.confirmed_pan + step_pan))
-            target_tilt = max(min_t, min(max_t, self.confirmed_tilt + step_tilt))
-
-            if target_pan != self.confirmed_pan or target_tilt != self.confirmed_tilt:
+            # Only transmit across I2C when a discrete degree change occurs
+            if cmd_pan != self.last_dispatched_pan or cmd_tilt != self.last_dispatched_tilt:
+                self.last_dispatched_pan = cmd_pan
+                self.last_dispatched_tilt = cmd_tilt
                 self._last_servo_cmd_time = now
-                self.confirmed_pan = target_pan
-                self.confirmed_tilt = target_tilt
-                self.current_pan = target_pan
-                self.current_tilt = target_tilt
                 from src.common.bus import MoveServoCommand
-                self.bus.publish(MoveServoCommand(pan=target_pan, tilt=target_tilt))
+                self.bus.publish(MoveServoCommand(pan=cmd_pan, tilt=cmd_tilt))
 
     def get_latest_processed_frame(self):
         """Read-only display renderer for the MJPEG diagnostic stream."""
