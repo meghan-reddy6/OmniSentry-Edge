@@ -64,12 +64,12 @@ servos:
   tracking:
     deadband_x: 0.10
     deadband_y: 0.10
-    kp_pan: 3.5
-    kd_pan: 0.30
-    kp_tilt: 2.8
-    kd_tilt: 0.25
+    kp_pan: 2.5
+    kd_pan: 0.50
+    kp_tilt: 2.0
+    kd_tilt: 0.40
     max_step_deg: 5.0
-    min_breakaway_deg: 1.2
+    min_breakaway_deg: 0.0
     update_interval_sec: 0.045
 
 orchestrator:

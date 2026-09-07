@@ -491,8 +491,8 @@ class VisionVLMAgent:
         if self.smooth_box is None:
             self.smooth_box = raw_box
         else:
-            # Faster EMA (0.75 weight to new frame) to eliminate trailing phase lag causing hover
-            self.smooth_box = 0.75 * raw_box + 0.25 * self.smooth_box
+            # Slower EMA (0.40 weight to new frame) for smoother, less jittery tracking
+            self.smooth_box = 0.40 * raw_box + 0.60 * self.smooth_box
 
         sx, sy, sw, sh = self.smooth_box
         self.locked_target_bbox = [int(sx), int(sy), int(sw), int(sh)]
@@ -517,10 +517,6 @@ class VisionVLMAgent:
             # Cap maximum angular step per update
             clamped_mag_x = min(self.max_step_deg, abs(pd_out_x))
 
-            # Breakaway torque floor to eliminate stalling at extreme angles
-            if clamped_mag_x < self.min_breakaway:
-                clamped_mag_x = self.min_breakaway
-
             # Direction Mapping:
             # error_x < 0 (target on camera left) -> Increase pan angle (+step)
             # error_x > 0 (target on camera right) -> Decrease pan angle (-step)
@@ -539,8 +535,6 @@ class VisionVLMAgent:
             pd_out_y = (self.kp_tilt * error_y) + (self.kd_tilt * d_err_y)
 
             clamped_mag_y = min(self.max_step_deg, abs(pd_out_y))
-            if clamped_mag_y < self.min_breakaway:
-                clamped_mag_y = self.min_breakaway
 
             # error_y > 0 (target low in frame) -> tilt down (decrease angle)
             # error_y < 0 (target high in frame) -> tilt up (increase angle)
