@@ -494,9 +494,10 @@ class VisionVLMAgent:
             min_t = int(tilt_cfg.get("min_angle", 45))
             max_t = int(tilt_cfg.get("max_angle", 110))
 
-            # Step strictly from confirmed physical hardware position
             target_pan = max(min_p, min(max_p, self.confirmed_pan + step_pan))
             target_tilt = max(min_t, min(max_t, self.confirmed_tilt + step_tilt))
+            
+            logger.info(f"[VisionTracking] err_x: {error_x:.3f}, err_y: {error_y:.3f} | step_p: {step_pan}°, step_t: {step_tilt}° | target_p: {target_pan}°, target_t: {target_tilt}° | current_confirmed_p: {self.confirmed_pan}°")
 
             if target_pan != self.confirmed_pan or target_tilt != self.confirmed_tilt:
                 self._last_servo_cmd_time = now

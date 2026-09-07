@@ -117,6 +117,7 @@ class ServoActuatorAgent:
 
         # Only execute I2C write if angle has changed by at least 1 full degree
         if clamped_pan != self.current_pan or clamped_tilt != self.current_tilt:
+            logger.info(f"[ServoAgent] Hardware Write -> Pan: {clamped_pan}°, Tilt: {clamped_tilt}° (was {self.current_pan}°, {self.current_tilt}°)")
             self.current_pan = clamped_pan
             self.current_tilt = clamped_tilt
 
