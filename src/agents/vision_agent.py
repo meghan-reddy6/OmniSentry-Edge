@@ -262,6 +262,7 @@ class VisionVLMAgent:
         self._infer_running = False
         self._infer_thread = None
         self._cam_thread = None
+        self._latest_annotated_frame = None
         # Event Bus Wireup
         if hasattr(self.bus, 'subscribe'):
             self.bus.subscribe("TrackCommand", self.handle_track_command)
@@ -314,8 +315,14 @@ class VisionVLMAgent:
                 continue
             
             consecutive_failures = 0
+            
+            # Create a copy for annotation so we don't mutate the raw frame if needed later
+            annotated = frame.copy()
+            self._render_annotations_in_place(annotated)
+            
             with self._frame_lock:
                 self._raw_frame = frame
+                self._latest_annotated_frame = annotated
 
         if self._cap:
             self._cap.release()
@@ -560,17 +567,13 @@ class VisionVLMAgent:
 
     def get_annotated_frame(self):
         """Returns the latest OpenCV frame with tracking reticles for web streaming."""
-        return self.get_latest_processed_frame()
-
-    def get_latest_processed_frame(self):
-        """Read-only display renderer for the MJPEG diagnostic stream."""
-        frame = None
         with self._frame_lock:
-            if self._raw_frame is not None:
-                frame = self._raw_frame.copy()
+            if self._latest_annotated_frame is not None:
+                return self._latest_annotated_frame.copy()
+        return None
 
-        if frame is None:
-            return None
+    def _render_annotations_in_place(self, frame):
+        """Internal method to draw HUD and reticles onto the frame."""
 
         h, w = frame.shape[:2]
         cx_frame, cy_frame = w // 2, h // 2
@@ -610,7 +613,7 @@ class VisionVLMAgent:
             status_text = "LOCKED" if self.locked_target_bbox else "ACQUIRING..."
             status_color = (0, 255, 128) if self.locked_target_bbox else (0, 200, 255)
         else:
-            status_text = "STANDBY"
+            status_text = "STANDBY - WAITING FOR COMMAND"
             status_color = (148, 163, 184)
 
         cv2.putText(frame, f"STATUS: {status_text}", (16, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.40, status_color, 1, cv2.LINE_AA)
@@ -653,27 +656,11 @@ class VisionVLMAgent:
         self._cam_thread.start()
         self._infer_thread.start()
 
-        port = self.config.get("system", {}).get("diagnostics_port", 8080)
-        host = self.config.get("system", {}).get("diagnostics_host", "0.0.0.0")
-        try:
-            self.http_server = ThreadedHTTPServer((host, port), MJPEGStreamHandler)
-            self.http_server.vision_agent = self
-            self.http_server.running = True
-            self._http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
-            self._http_thread.start()
-            logger.info(f"[VisionAgent]: Stream active at http://{host}:{port}/")
-        except Exception as e:
-            logger.warning(f"[VisionAgent]: HTTP server start failed: {e}")
-
         return True
 
     async def stop(self):
         self._camera_running = False
         self._infer_running = False
-        if self.http_server:
-            self.http_server.running = False
-            self.http_server.shutdown()
-            self.http_server.server_close()
         if self._cam_thread and self._cam_thread.is_alive():
             self._cam_thread.join(timeout=1.0)
         if self._infer_thread and self._infer_thread.is_alive():

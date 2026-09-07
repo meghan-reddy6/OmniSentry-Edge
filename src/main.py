@@ -138,10 +138,10 @@ async def main_async(config_path: str, headless: bool, port: int):
     if not headless:
         import threading
         import uvicorn
-        from src.web.server import create_app
+        from src.web.server import app, set_runtime_context
         
         logger.info(f"Starting Web Dashboard on port {port}...")
-        app = create_app(bus, vision, config)
+        set_runtime_context(bus, vision, config)
         
         def run_uvicorn():
             # Suppress uvicorn's verbose access logs unless in debug mode
