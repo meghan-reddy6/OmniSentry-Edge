@@ -194,21 +194,11 @@ class VisionVLMAgent:
         self.invert_pan = servo_cfg.get("pan", {}).get("invert", False)
         self.invert_tilt = servo_cfg.get("tilt", {}).get("invert", True)
 
-        pid_cfg = servo_cfg.get("pid", {})
-        self.kp_pan = float(pid_cfg.get("kp_pan", 6.5))
-        self.kd_pan = float(pid_cfg.get("kd_pan", 1.2))
-        self.kp_tilt = float(pid_cfg.get("kp_tilt", 4.8))
-        self.kd_tilt = float(pid_cfg.get("kd_tilt", 0.9))
-        self.deadband = float(pid_cfg.get("deadband", 0.025))
-        self.max_step = float(pid_cfg.get("max_step_deg", 6.0))
-
-        # PID Error Memory & Timers
-        self._prev_error_x = 0.0
-        self._prev_error_y = 0.0
-        self._last_pid_time = time.time()
-
-        self.current_pan = self.pan_base
-        self.current_tilt = self.tilt_base
+        # State tracking anchored to confirmed hardware values
+        self.confirmed_pan = int(self.config.get("servos", {}).get("pan", {}).get("base_angle", 90))
+        self.confirmed_tilt = int(self.config.get("servos", {}).get("tilt", {}).get("base_angle", 70))
+        self.current_pan = self.confirmed_pan
+        self.current_tilt = self.confirmed_tilt
 
         # Target Lock Tracking State
         self.is_tracking_active = False
@@ -247,11 +237,22 @@ class VisionVLMAgent:
         self._infer_running = False
         self._infer_thread = None
         self._cam_thread = None
-        self.http_server = None
+        # Event Bus Wireup
+        if hasattr(self.bus, 'subscribe'):
+            self.bus.subscribe("TrackCommand", self.handle_track_command)
+            self.bus.subscribe("StateChangeEvent", self.handle_state_change)
+            self.bus.subscribe("ServoTargetReachedEvent", self._on_servo_target_reached)
+            self.bus.subscribe("SoundLocalizedEvent", self.handle_sound_event)
+            self.bus.subscribe("AudioTelemetryEvent", self.handle_audio_telemetry)
 
-        # Bus Subscriptions
-        self.bus.subscribe("TrackCommand", self.handle_track_command)
-        self.bus.subscribe("ServoTargetReachedEvent", self.handle_servo_update)
+        self._last_servo_cmd_time = 0.0
+
+    def _on_servo_target_reached(self, event):
+        """Anchor reference strictly to physical hardware state."""
+        self.confirmed_pan = int(event.pan)
+        self.confirmed_tilt = int(event.tilt)
+        self.current_pan = self.confirmed_pan
+        self.current_tilt = self.confirmed_tilt
 
     def handle_track_command(self, event):
         prompt = getattr(event, 'prompt', None)
@@ -259,10 +260,6 @@ class VisionVLMAgent:
             self.set_track_prompt(str(prompt))
         else:
             self.stop_tracking()
-
-    def handle_servo_update(self, event):
-        self.current_pan = float(getattr(event, 'pan', self.current_pan))
-        self.current_tilt = float(getattr(event, 'tilt', self.current_tilt))
 
     def set_track_prompt(self, prompt: str):
         cleaned = prompt.strip().lower()
@@ -418,74 +415,17 @@ class VisionVLMAgent:
         matching_boxes.sort(key=lambda x: x[1], reverse=True)
         return matching_boxes[0][0]
 
-    def compute_pid_steps(self, error_x: float, error_y: float):
-        """Calculates fast, anti-overshoot angular adjustments."""
-        now = time.time()
-        dt = max(0.001, now - self._last_pid_time)
-        self._last_pid_time = now
-
-        step_pan = 0.0
-        step_tilt = 0.0
-
-        # --- Pan Axis (Horizontal) ---
-        if abs(error_x) > self.deadband:
-            # Derivative calculation
-            deriv_x = (error_x - self._prev_error_x) / dt
-            # Dynamic velocity scaling: speed increases with distance
-            boost_x = 1.0 + abs(error_x) * 1.5
-            p_term = error_x * self.kp_pan * boost_x
-            d_term = deriv_x * self.kd_pan
-
-            direction_x = 1.0 if self.invert_pan else -1.0
-            step_pan = direction_x * (p_term + d_term) * dt * 30.0
-            step_pan = max(-self.max_step, min(self.max_step, step_pan))
-            self._prev_error_x = error_x
-        else:
-            self._prev_error_x = 0.0
-
-        # --- Tilt Axis (Vertical) ---
-        if abs(error_y) > self.deadband:
-            deriv_y = (error_y - self._prev_error_y) / dt
-            boost_y = 1.0 + abs(error_y) * 1.2
-            p_term = error_y * self.kp_tilt * boost_y
-            d_term = deriv_y * self.kd_tilt
-
-            direction_y = 1.0 if self.invert_tilt else -1.0
-            step_tilt = direction_y * (p_term + d_term) * dt * 30.0
-            step_tilt = max(-self.max_step, min(self.max_step, step_tilt))
-            self._prev_error_y = error_y
-        else:
-            self._prev_error_y = 0.0
-
-        return step_pan, step_tilt
-
     def _process_servo_tracking_step(self, w, h):
         if not self.is_tracking_active or not self.current_prompt:
             return
 
         now = time.time()
-        # Ensure a minimum 50ms window between motor writes so the servo physically
-        # completes its travel before receiving the next target pulse
-        if not hasattr(self, "_last_servo_cmd_time"):
-            self._last_servo_cmd_time = 0.0
-        if (now - self._last_servo_cmd_time) < 0.050:
+        # Enforce 60ms settle window to prevent PCA9685 pulse saturation and H-bridge stalling
+        if (now - self._last_servo_cmd_time) < 0.060:
             return
 
         matched_box = self._select_locked_target(self._latest_detections, self.current_prompt)
-
-        if matched_box is not None:
-            bx, by, bw, bh = matched_box
-
-            if self.smooth_box is None:
-                self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
-            else:
-                self.smooth_box = 0.25 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.75 * self.smooth_box
-
-            sx, sy, sw, sh = [int(v) for v in self.smooth_box]
-            self.locked_target_bbox = [sx, sy, sw, sh]
-            self.current_target_bbox = (sx, sy, sw, sh)
-            self.lock_lost_timestamp = None
-        else:
+        if matched_box is None:
             if self.lock_lost_timestamp is None:
                 self.lock_lost_timestamp = now
             elif (now - self.lock_lost_timestamp) > self.lock_grace_period_sec:
@@ -494,28 +434,79 @@ class VisionVLMAgent:
                 self.smooth_box = None
             return
 
-        bx, by, bw, bh = self.locked_target_bbox
-        cx_frame, cy_frame = w // 2, h // 2
-        target_cx = bx + bw // 2
-        target_cy = by + bh // 2
+        self.lock_lost_timestamp = None
+        bx, by, bw, bh = matched_box
 
-        # Safeguard against 0 or negative center dimensions
+        # Discard corrupted or edge-clipped boxes that trigger false error vectors at boundaries
+        if bw < 10 or bh < 10 or bx <= 2 or (bx + bw) >= (w - 2):
+            return
+
+        # Low-pass EMA smoothing
+        if self.smooth_box is None:
+            self.smooth_box = np.array([bx, by, bw, bh], dtype=np.float32)
+        else:
+            self.smooth_box = 0.30 * np.array([bx, by, bw, bh], dtype=np.float32) + 0.70 * self.smooth_box
+
+        sx, sy, sw, sh = [int(v) for v in self.smooth_box]
+        self.locked_target_bbox = [sx, sy, sw, sh]
+        self.current_target_bbox = (sx, sy, sw, sh)
+
+        cx_frame, cy_frame = w // 2, h // 2
+        target_cx = sx + sw // 2
+        target_cy = sy + sh // 2
+
         denom_x = max(1.0, float(cx_frame))
         denom_y = max(1.0, float(cy_frame))
         error_x = (target_cx - cx_frame) / denom_x
         error_y = (target_cy - cy_frame) / denom_y
 
-        step_pan, step_tilt = self.compute_pid_steps(error_x, error_y)
+        deadband = float(self.config.get("servos", {}).get("deadband", 0.06))
 
-        if step_pan != 0.0 or step_tilt != 0.0:
-            target_pan = self.current_pan + step_pan
-            target_tilt = self.current_tilt + step_tilt
+        step_pan = 0
+        step_tilt = 0
 
-            self.current_pan = target_pan
-            self.current_tilt = target_tilt
+        # PAN AXIS: Breakaway torque scaling below 45° to overcome cable drag & static friction
+        if abs(error_x) > deadband:
+            excess = abs(error_x) - deadband
+            if self.confirmed_pan < 45 or self.confirmed_pan > 135:
+                # 3° minimum step to overcome static friction near mechanical limits
+                deg_x = max(3, min(7, int(round(excess * 6.0))))
+            else:
+                deg_x = max(2, min(5, int(round(excess * 4.5))))
 
-            self._last_servo_cmd_time = now
-            self.bus.publish(MoveServoCommand(pan=target_pan, tilt=target_tilt))
+            if self.invert_pan:
+                step_pan = -deg_x if error_x > 0 else deg_x
+            else:
+                step_pan = deg_x if error_x > 0 else -deg_x
+
+        # TILT AXIS
+        if abs(error_y) > deadband:
+            excess_y = abs(error_y) - deadband
+            deg_y = max(2, min(4, int(round(excess_y * 3.5))))
+            if self.invert_tilt:
+                step_tilt = -deg_y if error_y > 0 else deg_y
+            else:
+                step_tilt = deg_y if error_y > 0 else -deg_y
+
+        if step_pan != 0 or step_tilt != 0:
+            pan_cfg = self.config.get("servos", {}).get("pan", {})
+            tilt_cfg = self.config.get("servos", {}).get("tilt", {})
+
+            min_p = int(pan_cfg.get("min_angle", 15))
+            max_p = int(pan_cfg.get("max_angle", 165))
+            min_t = int(tilt_cfg.get("min_angle", 45))
+            max_t = int(tilt_cfg.get("max_angle", 110))
+
+            # Step strictly from confirmed physical hardware position
+            target_pan = max(min_p, min(max_p, self.confirmed_pan + step_pan))
+            target_tilt = max(min_t, min(max_t, self.confirmed_tilt + step_tilt))
+
+            if target_pan != self.confirmed_pan or target_tilt != self.confirmed_tilt:
+                self._last_servo_cmd_time = now
+                self.confirmed_pan = target_pan
+                self.confirmed_tilt = target_tilt
+                from src.common.bus import MoveServoCommand
+                self.bus.publish(MoveServoCommand(pan=target_pan, tilt=target_tilt))
 
     def get_latest_processed_frame(self):
         """Read-only display renderer for the MJPEG diagnostic stream."""

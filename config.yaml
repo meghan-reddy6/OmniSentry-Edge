@@ -45,29 +45,23 @@ servos:
   mode: "hardware"
   i2c_bus: 1
   i2c_address: 0x40
-  pwm_frequency: 50             # Crucial: 50Hz for stable servo holding torque
+  pwm_frequency: 50
 
   pan:
     channel: 0
-    min_angle: 0
-    max_angle: 180
+    min_angle: 15
+    max_angle: 165
     base_angle: 90
     invert: false
 
   tilt:
     channel: 1
-    min_angle: 50
-    max_angle: 100
-    base_angle: 90
+    min_angle: 45
+    max_angle: 110
+    base_angle: 70
     invert: false
 
-  pid:
-    kp_pan: 6.5
-    kd_pan: 1.2
-    kp_tilt: 4.8
-    kd_tilt: 0.9
-    deadband: 0.025
-    max_step_deg: 6.0
+  deadband: 0.06
 
 orchestrator:
   auto_track_speaker: false
