@@ -462,41 +462,41 @@ class VisionVLMAgent:
                     t_cap_ms = getattr(self, '_latest_cap_ms', 0.0)
     
                 # Run NPU inference only if tracking is actively engaged
-                if not self.is_tracking_active or not getattr(self, 'current_prompt', None):
+                is_active = self.is_tracking_active and getattr(self, 'current_prompt', None)
+                if not is_active:
                     self._latest_detections = []
-                    time.sleep(0.05)
-                    continue
+                    t_npu_ms = 0.0
+                else:
+                    t_npu_start = time.perf_counter()
+                    h, w = infer_frame.shape[:2]
+                    rgb_frame = cv2.cvtColor(infer_frame, cv2.COLOR_BGR2RGB)
+                    blob = np.transpose(rgb_frame, (2, 0, 1))
+                    blob = np.expand_dims(blob, axis=0).astype(np.uint8)
 
-                t_npu_start = time.perf_counter()
-                h, w = infer_frame.shape[:2]
-                rgb_frame = cv2.cvtColor(infer_frame, cv2.COLOR_BGR2RGB)
-                blob = np.transpose(rgb_frame, (2, 0, 1))
-                blob = np.expand_dims(blob, axis=0).astype(np.uint8)
-
-                raw_outputs = self._session.run(None, {self._input_name: blob})
-                boxes, confs, classes, labels = decode_detections(
-                    raw_outputs, w, h,
-                    conf_thresh=0.55,
-                    nms_thresh=self.nms_threshold
-                )
-                self._latest_detections = [
-                    (b, c, cid, lbl) for b, c, cid, lbl in zip(boxes, confs, classes, labels)
-                ]
+                    raw_outputs = self._session.run(None, {self._input_name: blob})
+                    boxes, confs, classes, labels = decode_detections(
+                        raw_outputs, w, h,
+                        conf_thresh=0.55,
+                        nms_thresh=self.nms_threshold
+                    )
+                    self._latest_detections = [
+                        (b, c, cid, lbl) for b, c, cid, lbl in zip(boxes, confs, classes, labels)
+                    ]
             except Exception as e:
                 logger.error(f"[VisionAgent]: Inference error: {e}")
                 time.sleep(0.05)
                 continue
                 
-            t_npu_end = time.perf_counter()
-            t_npu_ms = (t_npu_end - t_npu_start) * 1000.0
+            if is_active:
+                t_npu_end = time.perf_counter()
+                t_npu_ms = (t_npu_end - t_npu_start) * 1000.0
+                self._infer_counter += 1
+                if self._infer_counter % 20 == 0:
+                    now = time.perf_counter()
+                    self.infer_fps = 20.0 / (now - self._fps_infer_timer)
+                    self._fps_infer_timer = now
 
-            self._infer_counter += 1
-            if self._infer_counter % 20 == 0:
-                now = time.perf_counter()
-                self.infer_fps = 20.0 / (now - self._fps_infer_timer)
-                self._fps_infer_timer = now
-
-            matched = self._select_locked_target(self._latest_detections, self.current_prompt)
+            matched = self._select_locked_target(self._latest_detections, getattr(self, 'current_prompt', None))
             h, w = infer_frame.shape[:2]
 
             with self._tracking_lock:
