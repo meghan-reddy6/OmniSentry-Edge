@@ -870,6 +870,7 @@ class VisionVLMAgent:
         # Draw Target Box & Reticles if tracking is active
         with self._tracking_lock:
             locked_box = list(self.locked_target_bbox) if self.locked_target_bbox else None
+            prompt = self.current_prompt
             
         if self.is_tracking_active and locked_box:
             sx, sy, sw, sh = locked_box
@@ -881,7 +882,9 @@ class VisionVLMAgent:
 
             cv2.line(frame, (cx_frame, cy_frame), (target_cx, target_cy), (0, 215, 255), 1, cv2.LINE_AA)
             cv2.circle(frame, (target_cx, target_cy), 4, (0, 215, 255), -1)
-            cv2.putText(frame, f"TARGET: {self.current_prompt.upper()}", (sx, max(20, sy - 8)),
+            
+            target_name = prompt.upper() if prompt else "TARGET"
+            cv2.putText(frame, f"TARGET: {target_name}", (sx, max(20, sy - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, c_track, 1, cv2.LINE_AA)
         else:
             cv2.putText(
