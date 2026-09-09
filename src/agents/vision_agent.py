@@ -314,8 +314,8 @@ class VisionVLMAgent:
         self._infer_running = False
         self._infer_thread = None
         self._cam_thread = None
-        self._latest_annotated_frame = None
-        self._annotated_jpeg = None
+
+        self._preview_jpeg = None
         # Event Bus Wireup
         if hasattr(self.bus, 'subscribe'):
             self.bus.subscribe("TrackCommand", self.handle_track_command)
@@ -866,7 +866,7 @@ class VisionVLMAgent:
     def get_latest_jpeg(self):
         """Returns the pre-encoded JPEG bytes for streaming."""
         with self._frame_lock:
-            return self._annotated_jpeg
+            return self._preview_jpeg
 
     def get_annotated_frame(self):
         """Returns the latest OpenCV frame with tracking reticles for web streaming."""
