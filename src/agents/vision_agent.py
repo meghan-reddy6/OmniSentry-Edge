@@ -679,9 +679,11 @@ class VisionVLMAgent:
         return [max(0, fx), max(0, fy), max(20, fw), max(20, fh)]
 
     def _select_locked_target(self, candidate_detections, prompt):
-        if not prompt:
+        if not prompt or not isinstance(prompt, str):
             return None
-        target_lower = prompt.lower()
+        target_lower = prompt.strip().lower()
+        if not target_lower or not candidate_detections:
+            return None
         matching_boxes = []
 
         is_face_mode = target_lower in ("face", "head")
