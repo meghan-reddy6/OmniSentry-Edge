@@ -167,10 +167,35 @@ class MJPEGStreamHandler(BaseHTTPRequestHandler):
                     time.sleep(0.05)
 
 
+def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
+    """Resize and pad image while meeting stride-multiple constraints."""
+    shape = im.shape[:2]  # current shape [height, width]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+
+    # Scale ratio (new / old)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+
+    # Compute padding
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+
+    dw /= 2  # divide padding into 2 sides
+    dh /= 2
+
+    if shape[::-1] != new_unpad:  # resize
+        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return im, r, (dw, dh)
+
 class VisionVLMAgent:
     def __init__(self, bus, config):
         self.bus = bus
         self.config = config
+        self.input_size = (640, 640)
 
         vision_cfg = self.config.get("vision", {})
         cam_cfg = vision_cfg.get("camera", {})
@@ -319,9 +344,13 @@ class VisionVLMAgent:
                 continue
             
             consecutive_failures = 0
+
+            # Standardize frame to exact 640x640 letterboxed representation
+            letter_frame, ratio, (pad_w, pad_h) = letterbox(frame, new_shape=self.input_size)
+            h, w = letter_frame.shape[:2]
             
-            # Create a copy for annotation so we don't mutate the raw frame if needed later
-            annotated = frame.copy()
+            # Create a copy for annotation
+            annotated = letter_frame.copy()
             self._render_annotations_in_place(annotated)
             
             # Encode frame to JPEG
@@ -329,13 +358,17 @@ class VisionVLMAgent:
             jpeg_bytes = buffer.tobytes() if ret_encode else None
             
             with self._frame_lock:
-                self._raw_frame = frame
+                self._raw_frame = letter_frame
                 self._latest_annotated_frame = annotated
                 self._annotated_jpeg = jpeg_bytes
                 
-            # Run closed-loop servo stepping at camera frame rate (or throttled by update_interval)
-            h, w = frame.shape[:2]
-            self._process_servo_tracking_step(w, h)
+            # Run closed-loop servo stepping only when a new NPU detection is ready
+            with self._tracking_lock:
+                ready = self._new_detection_ready
+                self._new_detection_ready = False
+                
+            if ready:
+                self._process_servo_tracking_step(w, h)
 
         if self._cap:
             self._cap.release()
@@ -368,14 +401,14 @@ class VisionVLMAgent:
             try:
                 h, w = frame.shape[:2]
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                blob = cv2.resize(rgb_frame, (640, 640), interpolation=cv2.INTER_LINEAR)
-                blob = np.transpose(blob, (2, 0, 1))
+                # Frame is already letterboxed to 640x640, so we pass it directly
+                blob = np.transpose(rgb_frame, (2, 0, 1))
                 blob = np.expand_dims(blob, axis=0).astype(np.uint8)
 
                 raw_outputs = self._session.run(None, {self._input_name: blob})
                 boxes, confs, classes, labels = decode_detections(
                     raw_outputs, w, h,
-                    conf_thresh=self.conf_threshold,
+                    conf_thresh=0.55,
                     nms_thresh=self.nms_threshold
                 )
                 self._latest_detections = [
@@ -482,21 +515,19 @@ class VisionVLMAgent:
         self.lock_lost_timestamp = None
         bx, by, bw, bh = matched_box
 
-        # Discard degenerate bounding boxes
-        if bw < 12 or bh < 12:
-            return
+        # Guard: Filter out degenerate, full-frame, or noise boxes
+        if bw >= 20 and bh >= 20 and bw < (w * 0.95) and bh < (h * 0.95):
+            raw_box = np.array([bx, by, bw, bh], dtype=np.float32)
+            if self.smooth_box is None:
+                self.smooth_box = raw_box
+            else:
+                self.smooth_box = 0.35 * raw_box + 0.65 * self.smooth_box
 
-        # Continuous Exponential Moving Average (EMA) on detection coordinates
-        raw_box = np.array([bx, by, bw, bh], dtype=np.float32)
-        if self.smooth_box is None:
-            self.smooth_box = raw_box
+            sx, sy, sw, sh = self.smooth_box
+            self.locked_target_bbox = [int(sx), int(sy), int(sw), int(sh)]
+            self.current_target_bbox = tuple(self.locked_target_bbox)
         else:
-            # Slower EMA (0.40 weight to new frame) for smoother, less jittery tracking
-            self.smooth_box = 0.40 * raw_box + 0.60 * self.smooth_box
-
-        sx, sy, sw, sh = self.smooth_box
-        self.locked_target_bbox = [int(sx), int(sy), int(sw), int(sh)]
-        self.current_target_bbox = tuple(self.locked_target_bbox)
+            return
 
         cx_frame, cy_frame = w / 2.0, h / 2.0
         target_cx = sx + (sw / 2.0)
@@ -594,25 +625,31 @@ class VisionVLMAgent:
         cv2.circle(frame, (cx_frame, cy_frame), 25, c_gray, 1)
 
         # Draw Target Box & Reticles if tracking is active
-        if self.is_tracking_active and self.locked_target_bbox:
-            sx, sy, sw, sh = self.locked_target_bbox
+        with self._tracking_lock:
+            locked_box = list(self.locked_target_bbox) if self.locked_target_bbox else None
+            
+        if self.is_tracking_active and locked_box:
+            sx, sy, sw, sh = locked_box
             target_cx, target_cy = sx + sw // 2, sy + sh // 2
 
             c_track = (0, 255, 128)
-            k = 12
-            cv2.line(frame, (sx, sy), (sx + k, sy), c_track, 2)
-            cv2.line(frame, (sx, sy), (sx, sy + k), c_track, 2)
-            cv2.line(frame, (sx + sw, sy), (sx + sw - k, sy), c_track, 2)
-            cv2.line(frame, (sx + sw, sy), (sx + sw, sy + k), c_track, 2)
-            cv2.line(frame, (sx, sy + sh), (sx + k, sy + sh), c_track, 2)
-            cv2.line(frame, (sx, sy + sh), (sx, sy + sh - k), c_track, 2)
-            cv2.line(frame, (sx + sw, sy + sh), (sx + sw - k, sy + sh), c_track, 2)
-            cv2.line(frame, (sx + sw, sy + sh), (sx + sw, sy + sh - k), c_track, 2)
+            cv2.rectangle(frame, (sx, sy), (sx + sw, sy + sh), c_track, 2)
+            cv2.drawMarker(frame, (target_cx, target_cy), (0, 0, 255), cv2.MARKER_CROSS, 16, 2)
 
             cv2.line(frame, (cx_frame, cy_frame), (target_cx, target_cy), (0, 215, 255), 1, cv2.LINE_AA)
             cv2.circle(frame, (target_cx, target_cy), 4, (0, 215, 255), -1)
             cv2.putText(frame, f"TARGET: {self.current_prompt.upper()}", (sx, max(20, sy - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, c_track, 1, cv2.LINE_AA)
+        else:
+            cv2.putText(
+                frame,
+                "PREVIEW: NPU INPUT TENSOR (640x640) [STANDBY]",
+                (15, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (200, 200, 200),
+                1
+            )
 
         # HUD Panel
         cv2.rectangle(frame, (8, 8), (210, 56), (15, 23, 42), -1)
