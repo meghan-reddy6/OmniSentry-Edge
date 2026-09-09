@@ -429,22 +429,9 @@ class VisionVLMAgent:
                     self._latest_cap_ms = t_cap_ms
                     self._latest_seq = self.frame_seq
     
-                # Web preview annotation
-                annotated = optimal_frame.copy()
-                self._render_annotations_in_place(annotated)
-                
-                # Pre-encode JPEG for web client
-                ret, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if ret:
-                    self._preview_jpeg = jpeg.tobytes()
-                    
             except Exception as e:
                 logger.error(f"[VisionAgent]: Camera worker exception: {e}")
                 time.sleep(0.05)
-            ret_encode, buffer = cv2.imencode('.jpg', annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            if ret_encode:
-                with self._frame_lock:
-                    self._annotated_jpeg = buffer.tobytes()
 
             # Signal NPU tracking if we just generated a frame
             with self._tracking_lock:
@@ -552,6 +539,45 @@ class VisionVLMAgent:
                         at_limit=at_limit
                     )
                     logger.debug(line)
+
+            # Burn debug telemetry directly onto the 640x640 tensor view
+            model_view = infer_frame.copy()
+
+            # Target annotations
+            if self.locked_target_bbox is not None:
+                bx, by, bw, bh = self.locked_target_bbox
+                cv2.rectangle(model_view, (bx, by), (bx + bw, by + bh), (0, 255, 128), 2)
+                cv2.putText(
+                    model_view,
+                    f"NPU IN: {self.current_prompt} ({t_npu_ms:.1f}ms)",
+                    (bx, max(20, by - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 128),
+                    2
+                )
+                cv2.drawMarker(model_view, (bx + bw // 2, by + bh // 2), (0, 0, 255), cv2.MARKER_CROSS, 14, 2)
+
+            # Center optical target marker (320, 320)
+            cv2.drawMarker(model_view, (320, 320), (255, 255, 0), cv2.MARKER_TILTED_CROSS, 12, 1)
+
+            # Diagnostic HUD watermark
+            cv2.putText(
+                model_view,
+                f"TENSOR: 640x640 (DIRECT STRETCH) | INF: {t_npu_ms:.1f}ms",
+                (15, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 220, 255),
+                1
+            )
+
+            # Encode and publish as the active web preview stream
+            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+            ret_enc, jpeg = cv2.imencode(".jpg", model_view, encode_params)
+            if ret_enc:
+                with self._frame_lock:
+                    self._preview_jpeg = jpeg.tobytes()
 
             elapsed = time.time() - loop_start
             sleep_time = max(0.0, self.infer_throttle_sec - elapsed)
