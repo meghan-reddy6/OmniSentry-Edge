@@ -165,6 +165,7 @@ async def main_async(config_path: str, headless: bool, port: int):
         logger.info("System shutdown complete.")
 
 def main():
+    project_root = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser(description="RubikPi 3 Audio-Visual Sensing System")
     
     # Resolve the default config.yaml path dynamically relative to the project root directory
