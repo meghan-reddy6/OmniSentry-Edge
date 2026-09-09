@@ -75,12 +75,12 @@ class ServoActuatorAgent:
             self.current_pan = clamped_pan
             self.current_tilt = clamped_tilt
 
-            if self.mode == "hardware" and self.hardware:
+            if self.mode == "hardware" and self.driver:
                 try:
                     # Explicit bounds clamping via hardware driver
-                    self.hardware.set_servo_angle(self.pan_channel, clamped_pan, 
+                    self.driver.set_servo_angle(self.pan_channel, clamped_pan, 
                                           min_angle=self.pan_min, max_angle=self.pan_max)
-                    self.hardware.set_servo_angle(self.tilt_channel, clamped_tilt, 
+                    self.driver.set_servo_angle(self.tilt_channel, clamped_tilt, 
                                           min_angle=self.tilt_min, max_angle=self.tilt_max)
                 except Exception as e:
                     logger.error(f"[ServoAgent]: I2C write error: {e}")
