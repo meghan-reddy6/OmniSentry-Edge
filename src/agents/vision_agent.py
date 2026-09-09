@@ -286,6 +286,8 @@ class VisionVLMAgent:
         self._camera_running = False
         self._raw_frame = None
         self._frame_lock = threading.Lock()
+        self._tracking_lock = threading.Lock()
+        self._new_detection_ready = False
         self._latest_detections = []
         self._infer_running = False
         self._infer_thread = None
@@ -414,6 +416,8 @@ class VisionVLMAgent:
                 self._latest_detections = [
                     (b, c, cid, lbl) for b, c, cid, lbl in zip(boxes, confs, classes, labels)
                 ]
+                with self._tracking_lock:
+                    self._new_detection_ready = True
 
             except Exception as e:
                 logger.error(f"[VisionAgent]: Inference error: {e}")
