@@ -12,6 +12,37 @@ from src.common.bus import MoveServoCommand, ServoTargetReachedEvent, TrackComma
 
 logger = logging.getLogger(__name__)
 
+def read_system_temp():
+    """Reads SoC/NPU temperature in Celsius from sysfs."""
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            return float(f.read().strip()) / 1000.0
+    except Exception:
+        return 0.0
+def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
+    """Resize and pad image while meeting stride-multiple constraints."""
+    shape = im.shape[:2]  # current shape [height, width]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+
+    # Scale ratio (new / old)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+
+    # Compute padding
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+
+    dw /= 2  # divide padding into 2 sides
+    dh /= 2
+
+    if shape[::-1] != new_unpad:  # resize
+        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return im, r, (dw, dh)
+
 DEFAULT_COCO_CLASSES = [
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
     "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
@@ -264,6 +295,16 @@ class VisionVLMAgent:
         self.prompt_supported = True
         self._inference_buffer = None
 
+        self.frame_seq = 0
+        self.dropped_frames = 0
+        self._fps_cap_timer = time.perf_counter()
+        self._fps_infer_timer = time.perf_counter()
+        self.cap_fps = 0.0
+        self.infer_fps = 0.0
+        self._infer_counter = 0
+        self._cached_temp = read_system_temp()
+        self._last_temp_read = time.time()
+
         # NPU / QNN Session Initialization
         REPO_ROOT = Path(__file__).resolve().parent.parent.parent
         model_cfg_path = npu_cfg.get("model_path", "models/yolov8_det.onnx")
@@ -330,47 +371,106 @@ class VisionVLMAgent:
         self.lock_lost_timestamp = None
         logger.info("[VisionAgent]: Tracking STOPPED. Gimbal locked in Standby.")
 
+    def format_telemetry_line(self, seq, t_cap, t_npu, t_total, target, box, conf, err_x, err_y, 
+                              pd_p, pd_d, pan, tilt, at_limit):
+        """Constructs an aligned, human-readable overview of the full system state."""
+        # Refresh thermal stat every 2 seconds
+        now = time.time()
+        if now - self._last_temp_read > 2.0:
+            self._cached_temp = read_system_temp()
+            self._last_temp_read = now
+
+        # Target block
+        if box is not None:
+            bx, by, bw, bh = box
+            box_str = f"[{bx:3d},{by:3d},{bw:3d},{bh:3d}] @ {conf:.2f}"
+            err_str = f"X:{err_x:+.2f} Y:{err_y:+.2f}"
+            pd_str = f"P:{pd_p:+.1f} D:{pd_d:+.1f}"
+            act_str = f"Pan:{pan:3d}° Tilt:{tilt:3d}°"
+        else:
+            box_str = "------- NO TARGET -------"
+            err_str = "X: ----  Y: ---- "
+            pd_str = "P: ---- D: ----"
+            act_str = f"HOLD ({pan:3d}°,{tilt:3d}°)"
+
+        status_flag = "[LIMIT!]" if at_limit else "[TRACK ]" if box else "[IDLE  ]"
+
+        return (
+            f"[FRM #{seq:05d} {status_flag}] "
+            f"FPS: {self.cap_fps:4.1f}C/{self.infer_fps:4.1f}N | "
+            f"Lat: {t_total:4.1f}ms (Cap:{t_cap:3.1f} NPU:{t_npu:4.1f}) | "
+            f"Target: {target:<7s} {box_str} | "
+            f"Err: {err_str} | "
+            f"PD: {pd_str} | "
+            f"Act: {act_str} | "
+            f"SoC: {self._cached_temp:4.1f}°C"
+        )
+
     def _camera_capture_worker(self):
         consecutive_failures = 0
         while self._camera_running:
             if not self._cap or not self._cap.isOpened():
                 time.sleep(0.1)
                 continue
-                
-            ret, frame = self._cap.read()
-            if not ret or frame is None:
+
+            t_capture_start = time.perf_counter()
+            ret, raw_frame = self._cap.read()
+            if not ret or raw_frame is None:
+                self.dropped_frames += 1
                 consecutive_failures += 1
                 if consecutive_failures % 100 == 0:
                     logger.warning("[VisionAgent]: Continuous frame read failures detected. Is the camera unplugged?")
                 time.sleep(0.01)
                 continue
-            
+
             consecutive_failures = 0
 
-            # Standardize frame to exact 640x640 letterboxed representation
-            letter_frame, ratio, (pad_w, pad_h) = letterbox(frame, new_shape=self.input_size)
-            h, w = letter_frame.shape[:2]
+            # Optimized Center Crop to 1:1 aspect ratio, then resize to 640x640
+            # This completely avoids gray padding (letterbox) AND aspect ratio distortion (direct stretch)
+            h_raw, w_raw = raw_frame.shape[:2]
+            if w_raw > h_raw:
+                diff = (w_raw - h_raw) // 2
+                cropped = raw_frame[:, diff:diff+h_raw]
+            else:
+                diff = (h_raw - w_raw) // 2
+                cropped = raw_frame[diff:diff+w_raw, :]
             
-            # Create a copy for annotation
-            annotated = letter_frame.copy()
-            self._render_annotations_in_place(annotated)
-            
-            # Encode frame to JPEG
-            ret_encode, buffer = cv2.imencode('.jpg', annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            jpeg_bytes = buffer.tobytes() if ret_encode else None
-            
+            # Now we have a perfect 1:1 square, we can stretch it to 640x640 with zero distortion!
+            optimal_frame = cv2.resize(cropped, (640, 640), interpolation=cv2.INTER_LINEAR)
+            t_capture_end = time.perf_counter()
+
+            self.frame_seq += 1
+            t_cap_ms = (t_capture_end - t_capture_start) * 1000.0
+
+            # Calculate Capture FPS every 30 frames
+            if self.frame_seq % 30 == 0:
+                now = time.perf_counter()
+                self.cap_fps = 30.0 / (now - self._fps_cap_timer)
+                self._fps_cap_timer = now
+
             with self._frame_lock:
-                self._raw_frame = letter_frame
-                self._latest_annotated_frame = annotated
-                self._annotated_jpeg = jpeg_bytes
-                
-            # Run closed-loop servo stepping only when a new NPU detection is ready
+                self._latest_tensor_frame = optimal_frame
+                self._latest_cap_time = t_capture_start
+                self._latest_cap_ms = t_cap_ms
+                self._latest_seq = self.frame_seq
+
+            # Web preview annotation
+            annotated = optimal_frame.copy()
+            self._render_annotations_in_place(annotated)
+            ret_encode, buffer = cv2.imencode('.jpg', annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if ret_encode:
+                with self._frame_lock:
+                    self._annotated_jpeg = buffer.tobytes()
+
+            # Signal NPU tracking if we just generated a frame
             with self._tracking_lock:
                 ready = self._new_detection_ready
                 self._new_detection_ready = False
-                
+
             if ready:
-                self._process_servo_tracking_step(w, h)
+                pass # Servo step now handled inside _async_npu_worker to minimize latency
+
+            time.sleep(0.005)
 
         if self._cap:
             self._cap.release()
@@ -379,20 +479,15 @@ class VisionVLMAgent:
     def _async_npu_worker(self):
         while self._infer_running:
             loop_start = time.time()
-            has_frame = False
-
+            
             with self._frame_lock:
-                if self._raw_frame is not None:
-                    if self._inference_buffer is None or self._inference_buffer.shape != self._raw_frame.shape:
-                        self._inference_buffer = np.empty_like(self._raw_frame)
-                    np.copyto(self._inference_buffer, self._raw_frame)
-                    has_frame = True
-
-            if not has_frame:
-                time.sleep(0.01)
-                continue
-
-            frame = self._inference_buffer
+                if getattr(self, '_latest_tensor_frame', None) is None:
+                    time.sleep(0.01)
+                    continue
+                infer_frame = self._latest_tensor_frame.copy()
+                seq = getattr(self, '_latest_seq', 0)
+                t_cap_start = getattr(self, '_latest_cap_time', 0.0)
+                t_cap_ms = getattr(self, '_latest_cap_ms', 0.0)
 
             # Run NPU inference only if tracking is actively engaged
             if not self.is_tracking_active or not self.current_prompt:
@@ -400,10 +495,10 @@ class VisionVLMAgent:
                 time.sleep(0.05)
                 continue
 
+            t_npu_start = time.perf_counter()
             try:
-                h, w = frame.shape[:2]
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Frame is already letterboxed to 640x640, so we pass it directly
+                h, w = infer_frame.shape[:2]
+                rgb_frame = cv2.cvtColor(infer_frame, cv2.COLOR_BGR2RGB)
                 blob = np.transpose(rgb_frame, (2, 0, 1))
                 blob = np.expand_dims(blob, axis=0).astype(np.uint8)
 
@@ -416,17 +511,161 @@ class VisionVLMAgent:
                 self._latest_detections = [
                     (b, c, cid, lbl) for b, c, cid, lbl in zip(boxes, confs, classes, labels)
                 ]
-                with self._tracking_lock:
-                    self._new_detection_ready = True
-
             except Exception as e:
                 logger.error(f"[VisionAgent]: Inference error: {e}")
                 time.sleep(0.05)
+                continue
+                
+            t_npu_end = time.perf_counter()
+            t_npu_ms = (t_npu_end - t_npu_start) * 1000.0
+
+            self._infer_counter += 1
+            if self._infer_counter % 20 == 0:
+                now = time.perf_counter()
+                self.infer_fps = 20.0 / (now - self._fps_infer_timer)
+                self._fps_infer_timer = now
+
+            matched = self._select_locked_target(self._latest_detections, self.current_prompt)
+            h, w = infer_frame.shape[:2]
+
+            with self._tracking_lock:
+                if matched is not None:
+                    bx, by, bw, bh = matched
+                    conf = getattr(self, "_last_match_conf", 0.90) # Dummy placeholder for confidence
+                    raw_box = np.array([bx, by, bw, bh], dtype=np.float32)
+                    if self.smooth_box is None:
+                        self.smooth_box = raw_box
+                    else:
+                        self.smooth_box = 0.50 * raw_box + 0.50 * self.smooth_box
+                    self.locked_target_bbox = [int(v) for v in self.smooth_box]
+                else:
+                    self.locked_target_bbox = None
+                    self.smooth_box = None
+                    conf = 0.0
+
+            # Execute PD Step and collect math diagnostics
+            err_x, err_y, pd_p, pd_d, at_limit = self._process_servo_tracking_step_instrumented(w, h)
+
+            t_actuator_done = time.perf_counter()
+            t_total_ms = (t_actuator_done - t_cap_start) * 1000.0
+
+            if logger.isEnabledFor(logging.DEBUG):
+                if seq % 10 == 0 or matched is not None:
+                    line = self.format_telemetry_line(
+                        seq=seq,
+                        t_cap=t_cap_ms,
+                        t_npu=t_npu_ms,
+                        t_total=t_total_ms,
+                        target=self.current_prompt or "idle",
+                        box=self.locked_target_bbox,
+                        conf=conf,
+                        err_x=err_x,
+                        err_y=err_y,
+                        pd_p=pd_p,
+                        pd_d=pd_d,
+                        pan=self.last_dispatched_pan,
+                        tilt=self.last_dispatched_tilt,
+                        at_limit=at_limit
+                    )
+                    logger.debug(line)
 
             elapsed = time.time() - loop_start
             sleep_time = max(0.0, self.infer_throttle_sec - elapsed)
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+    def _process_servo_tracking_step_instrumented(self, w, h):
+        err_x, err_y = 0.0, 0.0
+        pd_p, pd_d = 0.0, 0.0
+        at_limit = False
+
+        if not self.is_tracking_active or not self.current_prompt:
+            return err_x, err_y, pd_p, pd_d, at_limit
+
+        now = time.time()
+        # Enforce exact physical pacing window
+        if (now - self._last_servo_cmd_time) < self.update_interval:
+            return err_x, err_y, pd_p, pd_d, at_limit
+
+        dt = now - self._last_servo_cmd_time if self._last_servo_cmd_time > 0 else self.update_interval
+        if dt <= 0.0 or dt > 0.25:
+            dt = self.update_interval
+
+        with self._tracking_lock:
+            if self.locked_target_bbox is None:
+                self._prev_error_x = 0.0
+                self._prev_error_y = 0.0
+                return err_x, err_y, pd_p, pd_d, at_limit
+                
+            sx, sy, sw, sh = self.locked_target_bbox
+
+        cx_frame, cy_frame = w / 2.0, h / 2.0
+        target_cx = sx + (sw / 2.0)
+        target_cy = sy + (sh / 2.0)
+
+        # Normalized screen error in [-1.0, 1.0]
+        error_x = (target_cx - cx_frame) / max(1.0, cx_frame)
+        error_y = (target_cy - cy_frame) / max(1.0, cy_frame)
+        
+        err_x = error_x
+        err_y = error_y
+
+        delta_pan = 0.0
+        delta_tilt = 0.0
+
+        # --- PAN CONTROLLER ---
+        if abs(error_x) > self.deadband_x:
+            d_err_x = (error_x - self._prev_error_x) / dt
+            pd_p = (self.kp_pan * error_x)
+            pd_d = (self.kd_pan * d_err_x)
+            pd_out_x = pd_p + pd_d
+
+            clamped_mag_x = min(self.max_step_deg, abs(pd_out_x))
+            if clamped_mag_x == self.max_step_deg:
+                at_limit = True
+
+            sign_x = -1.0 if error_x > 0 else 1.0
+            if self.invert_pan:
+                sign_x = -sign_x
+            delta_pan = sign_x * clamped_mag_x
+        else:
+            self._prev_error_x = error_x
+
+        self._prev_error_x = error_x
+
+        # --- TILT CONTROLLER ---
+        if abs(error_y) > self.deadband_y:
+            d_err_y = (error_y - self._prev_error_y) / dt
+            pd_out_y = (self.kp_tilt * error_y) + (self.kd_tilt * d_err_y)
+
+            clamped_mag_y = min(self.max_step_deg, abs(pd_out_y))
+            if clamped_mag_y == self.max_step_deg:
+                at_limit = True
+
+            sign_y = -1.0 if error_y > 0 else 1.0
+            if self.invert_tilt:
+                sign_y = -sign_y
+            delta_tilt = sign_y * clamped_mag_y
+        else:
+            self._prev_error_y = error_y
+
+        self._prev_error_y = error_y
+
+        # Integrate and clamp in high-precision float space
+        if delta_pan != 0.0 or delta_tilt != 0.0:
+            self.virtual_pan = max(self.pan_min, min(self.pan_max, self.virtual_pan + delta_pan))
+            self.virtual_tilt = max(self.tilt_min, min(self.tilt_max, self.virtual_tilt + delta_tilt))
+
+            cmd_pan = int(round(self.virtual_pan))
+            cmd_tilt = int(round(self.virtual_tilt))
+
+            if cmd_pan != self.last_dispatched_pan or cmd_tilt != self.last_dispatched_tilt:
+                self.last_dispatched_pan = cmd_pan
+                self.last_dispatched_tilt = cmd_tilt
+                self._last_servo_cmd_time = now
+                self.bus.publish(MoveServoCommand(pan=cmd_pan, tilt=cmd_tilt))
+
+        return err_x, err_y, pd_p, pd_d, at_limit
 
     def _compute_iou(self, boxA, boxB):
         xA = max(boxA[0], boxB[0])

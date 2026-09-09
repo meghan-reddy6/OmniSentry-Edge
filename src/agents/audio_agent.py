@@ -121,7 +121,10 @@ class AudioSensingAgent:
                     if confidence >= self.min_confidence and (curr_time - self._last_event_time) >= self.cooldown_sec:
                         self._last_event_time = curr_time
                         self._smoothed_angle = 0.7 * est_angle + 0.3 * self._smoothed_angle
-                        logger.info(f"[AudioAgent]: Localized Sound -> Angle: {self._smoothed_angle:+.1f}°, Vol: {volume_db:.1f} dB, Conf: {confidence:.2f}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[AUDIO ] Localized: {self._smoothed_angle:+05.1f}° | Vol: {volume_db:4.1f}dB | Conf: {confidence:4.2f}")
+                        else:
+                            logger.info(f"[AudioAgent]: Localized Sound -> Angle: {self._smoothed_angle:+.1f}°, Vol: {volume_db:.1f} dB, Conf: {confidence:.2f}")
                         self.bus.publish(SoundLocalizedEvent(angle=self._smoothed_angle, volume=volume_db, confidence=confidence))
             except Exception as e:
                 time.sleep(0.01)
