@@ -1,12 +1,7 @@
 import time
-import sys
+import logging
 
-try:
-    import smbus2
-except ImportError:
-    print("Error: Required smbus2 library not found.")
-    print("Run: pip install smbus2")
-    sys.exit(1)
+logger = logging.getLogger(__name__)
 
 # --- PCA9685 Registers & Constants ---
 PCA9685_ADDRESS = 0x40
@@ -16,6 +11,7 @@ LED0_ON_L = 0x06
 
 class PCA9685Direct:
     def __init__(self, bus_num=1, address=PCA9685_ADDRESS):
+        import smbus2
         self.bus = smbus2.SMBus(bus_num)
         self.address = address
         self.reset()
@@ -43,9 +39,9 @@ class PCA9685Direct:
         data = [on & 0xFF, (on >> 8) & 0xFF, off & 0xFF, (off >> 8) & 0xFF]
         self.bus.write_i2c_block_data(self.address, reg, data)
 
-    def set_servo_angle(self, channel, angle_deg, min_us=500, max_us=2400):
-        """Map angle (0-180 deg) to 12-bit PCA9685 counter ticks at 50Hz (20ms period)."""
-        clamped_angle = max(0.0, min(180.0, float(angle_deg)))
+    def set_servo_angle(self, channel, angle_deg, min_angle=0.0, max_angle=180.0, min_us=500, max_us=2400):
+        """Map angle to 12-bit PCA9685 counter ticks at 50Hz (20ms period). Clamps angle explicitly."""
+        clamped_angle = max(float(min_angle), min(float(max_angle), float(angle_deg)))
         pulse_us = min_us + (clamped_angle / 180.0) * (max_us - min_us)
         ticks = int(pulse_us * 4096.0 / 20000.0)
         self.set_pwm(channel, 0, ticks)
@@ -55,39 +51,3 @@ class PCA9685Direct:
             self.bus.close()
         except Exception:
             pass
-
-
-def test_servos():
-    print("Initializing I2C bus and PCA9685 driver via smbus2...")
-    try:
-        driver = PCA9685Direct(bus_num=1, address=0x40)
-    except Exception as e:
-        print(f"Hardware init failed: {e}")
-        print("Make sure you are running on the Rubik Pi with the PCA9685 connected to /dev/i2c-1.")
-        sys.exit(1)
-
-    # By default, Pan is on Channel 0, Tilt is on Channel 1
-    # 90 degrees is the center/home point for a standard 180 degree servo
-    angles = [90, 45, 135, 90]
-
-    print("Starting servo movement sweep test...")
-    try:
-        for angle in angles:
-            print(f"Moving Pan (Ch 0) and Tilt (Ch 1) to {angle} degrees...")
-            driver.set_servo_angle(0, angle)
-            driver.set_servo_angle(1, angle)
-            time.sleep(1.5)
-            
-        print("Servo sweep test completed successfully.")
-    except Exception as e:
-        print(f"Servo write error: {e}")
-    finally:
-        # Graceful hardware teardown
-        try:
-            driver.close()
-            print("PCA9685 de-initialized.")
-        except:
-            pass
-
-if __name__ == "__main__":
-    test_servos()

@@ -127,7 +127,8 @@ class AudioSensingAgent:
                             logger.info(f"[AudioAgent]: Localized Sound -> Angle: {self._smoothed_angle:+.1f}°, Vol: {volume_db:.1f} dB, Conf: {confidence:.2f}")
                         self.bus.publish(SoundLocalizedEvent(angle=self._smoothed_angle, volume=volume_db, confidence=confidence))
             except Exception as e:
-                time.sleep(0.01)
+                logger.error(f"[AudioAgent]: Audio worker exception: {e}")
+                time.sleep(0.05)
 
         if stream:
             stream.stop_stream()

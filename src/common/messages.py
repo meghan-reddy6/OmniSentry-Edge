@@ -85,11 +85,6 @@ class VoiceCommandEvent(Event):
     transcript: str
 
 @dataclass
-class SimulateSpeechCommand(Event):
-    """Simulates voice input by injecting a transcription directly into the audio agent."""
-    text: str
-
-@dataclass
 class AudioLevelEvent(Event):
     """Emitted by AudioSensingAgent to broadcast real-time volume levels."""
     rms_db: float

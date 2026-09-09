@@ -9,14 +9,9 @@ import logging
 import sys
 import os
 
-# Ensure the project root directory is in the sys.path list to resolve 'src' imports
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
 from src.common.config import SystemConfig
 from src.common.bus import EventBus
-from src.common.messages import TrackCommand, SimulateSpeechCommand
+from src.common.messages import TrackCommand
 from src.common.bus import MoveServoCommand
 from src.agents.orchestrator import OrchestratorAgent
 from src.agents.audio_agent import AudioSensingAgent
@@ -37,7 +32,6 @@ async def cli_input_loop(bus: EventBus, config: SystemConfig, shutdown_event: as
     print("  track <prompt>  - Initialize VLM tracking loop (e.g. 'track cup')")
     print("  home            - Command the Pan/Tilt servos back to home (0, 0)")
     print("  goto <p> <t>    - Move gimbal to explicit pan/tilt coords (e.g. 'goto 120 70')")
-    print("  say <phrase>    - Inject a simulated voice command transcription")
     print("  exit            - Stop all agents and terminate the program")
     print("="*60 + "\n")
 
@@ -70,13 +64,6 @@ async def cli_input_loop(bus: EventBus, config: SystemConfig, shutdown_event: as
                 bus.publish(TrackCommand(prompt=""))
                 # Drive servos to base position
                 bus.publish(MoveServoCommand(pan=pan_base, tilt=tilt_base))
-            elif cmd == "say":
-                if len(parts) < 2 or not parts[1].strip():
-                    print("Error: Missing text for simulated speech (e.g. 'say sentry')")
-                    continue
-                phrase = parts[1].strip()
-                logger.info(f"CLI: Injecting simulated speech transcript: '{phrase}'")
-                bus.publish(SimulateSpeechCommand(text=phrase))
             elif cmd == "goto" or cmd == "move":
                 if len(parts) == 2:
                     coords = parts[1].split()
@@ -97,7 +84,7 @@ async def cli_input_loop(bus: EventBus, config: SystemConfig, shutdown_event: as
                 else:
                     print("Usage: goto <pan> <tilt> (e.g. 'goto 120 70')")
             else:
-                print(f"Unknown command: '{cmd}'. Commands: 'track <prompt>', 'home', 'goto <pan> <tilt>', 'say <phrase>', 'exit'")
+                print(f"Unknown command: '{cmd}'. Commands: 'track <prompt>', 'home', 'goto <pan> <tilt>', 'exit'")
         except asyncio.CancelledError:
             break
         except Exception as e:

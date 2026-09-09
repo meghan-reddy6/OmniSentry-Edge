@@ -198,29 +198,10 @@ class MJPEGStreamHandler(BaseHTTPRequestHandler):
                     time.sleep(0.05)
 
 
-def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
-    """Resize and pad image while meeting stride-multiple constraints."""
-    shape = im.shape[:2]  # current shape [height, width]
-    if isinstance(new_shape, int):
-        new_shape = (new_shape, new_shape)
+import os
+from pathlib import Path
 
-    # Scale ratio (new / old)
-    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-
-    # Compute padding
-    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
-    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
-
-    dw /= 2  # divide padding into 2 sides
-    dh /= 2
-
-    if shape[::-1] != new_unpad:  # resize
-        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
-
-    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-    return im, r, (dw, dh)
+from src.hardware.camera import CameraStream
 
 class VisionVLMAgent:
     def __init__(self, bus, config):
@@ -323,11 +304,11 @@ class VisionVLMAgent:
         self._session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
         self._input_name = self._session.get_inputs()[0].name
 
-        self._cap = None
+        self._cap = CameraStream(self.camera_index, self.frame_width, self.frame_height, self.target_fps)
         self._camera_running = False
-        self._raw_frame = None
+        self._tensor_frame = None
         self._frame_lock = threading.Lock()
-        self._tracking_lock = threading.Lock()
+        self._tracking_lock = threading.RLock()
         self._new_detection_ready = False
         self._latest_detections = []
         self._infer_running = False
@@ -409,54 +390,57 @@ class VisionVLMAgent:
     def _camera_capture_worker(self):
         consecutive_failures = 0
         while self._camera_running:
-            if not self._cap or not self._cap.isOpened():
-                time.sleep(0.1)
-                continue
-
-            t_capture_start = time.perf_counter()
-            ret, raw_frame = self._cap.read()
-            if not ret or raw_frame is None:
-                self.dropped_frames += 1
-                consecutive_failures += 1
-                if consecutive_failures % 100 == 0:
-                    logger.warning("[VisionAgent]: Continuous frame read failures detected. Is the camera unplugged?")
-                time.sleep(0.01)
-                continue
-
-            consecutive_failures = 0
-
-            # Optimized Center Crop to 1:1 aspect ratio, then resize to 640x640
-            # This completely avoids gray padding (letterbox) AND aspect ratio distortion (direct stretch)
-            h_raw, w_raw = raw_frame.shape[:2]
-            if w_raw > h_raw:
-                diff = (w_raw - h_raw) // 2
-                cropped = raw_frame[:, diff:diff+h_raw]
-            else:
-                diff = (h_raw - w_raw) // 2
-                cropped = raw_frame[diff:diff+w_raw, :]
-            
-            # Now we have a perfect 1:1 square, we can stretch it to 640x640 with zero distortion!
-            optimal_frame = cv2.resize(cropped, (640, 640), interpolation=cv2.INTER_LINEAR)
-            t_capture_end = time.perf_counter()
-
-            self.frame_seq += 1
-            t_cap_ms = (t_capture_end - t_capture_start) * 1000.0
-
-            # Calculate Capture FPS every 30 frames
-            if self.frame_seq % 30 == 0:
-                now = time.perf_counter()
-                self.cap_fps = 30.0 / (now - self._fps_cap_timer)
-                self._fps_cap_timer = now
-
-            with self._frame_lock:
-                self._latest_tensor_frame = optimal_frame
-                self._latest_cap_time = t_capture_start
-                self._latest_cap_ms = t_cap_ms
-                self._latest_seq = self.frame_seq
-
-            # Web preview annotation
-            annotated = optimal_frame.copy()
-            self._render_annotations_in_place(annotated)
+            try:
+                t_capture_start = time.perf_counter()
+                ret, raw_frame = self._cap.read()
+                if not ret or raw_frame is None:
+                    self.dropped_frames += 1
+                    consecutive_failures += 1
+                    if consecutive_failures % 100 == 0:
+                        logger.warning("[VisionAgent]: Continuous frame read failures detected. Is the camera unplugged?")
+                    time.sleep(0.01)
+                    continue
+    
+                consecutive_failures = 0
+    
+                # Optimized Center Crop to 1:1 aspect ratio, then resize to 640x640
+                h_raw, w_raw = raw_frame.shape[:2]
+                if w_raw > h_raw:
+                    diff = (w_raw - h_raw) // 2
+                    cropped = raw_frame[:, diff:diff+h_raw]
+                else:
+                    diff = (h_raw - w_raw) // 2
+                    cropped = raw_frame[diff:diff+w_raw, :]
+                
+                optimal_frame = cv2.resize(cropped, (640, 640), interpolation=cv2.INTER_LINEAR)
+                t_capture_end = time.perf_counter()
+    
+                self.frame_seq += 1
+                t_cap_ms = (t_capture_end - t_capture_start) * 1000.0
+    
+                if self.frame_seq % 30 == 0:
+                    now = time.perf_counter()
+                    self.cap_fps = 30.0 / (now - self._fps_cap_timer)
+                    self._fps_cap_timer = now
+    
+                with self._frame_lock:
+                    self._tensor_frame = optimal_frame
+                    self._latest_cap_time = t_capture_start
+                    self._latest_cap_ms = t_cap_ms
+                    self._latest_seq = self.frame_seq
+    
+                # Web preview annotation
+                annotated = optimal_frame.copy()
+                self._render_annotations_in_place(annotated)
+                
+                # Pre-encode JPEG for web client
+                ret, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ret:
+                    self._preview_jpeg = jpeg.tobytes()
+                    
+            except Exception as e:
+                logger.error(f"[VisionAgent]: Camera worker exception: {e}")
+                time.sleep(0.05)
             ret_encode, buffer = cv2.imencode('.jpg', annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ret_encode:
                 with self._frame_lock:
@@ -478,25 +462,25 @@ class VisionVLMAgent:
 
     def _async_npu_worker(self):
         while self._infer_running:
-            loop_start = time.time()
-            
-            with self._frame_lock:
-                if getattr(self, '_latest_tensor_frame', None) is None:
-                    time.sleep(0.01)
-                    continue
-                infer_frame = self._latest_tensor_frame.copy()
-                seq = getattr(self, '_latest_seq', 0)
-                t_cap_start = getattr(self, '_latest_cap_time', 0.0)
-                t_cap_ms = getattr(self, '_latest_cap_ms', 0.0)
-
-            # Run NPU inference only if tracking is actively engaged
-            if not self.is_tracking_active or not self.current_prompt:
-                self._latest_detections = []
-                time.sleep(0.05)
-                continue
-
-            t_npu_start = time.perf_counter()
             try:
+                loop_start = time.time()
+                
+                with self._frame_lock:
+                    if getattr(self, '_tensor_frame', None) is None:
+                        time.sleep(0.01)
+                        continue
+                    infer_frame = self._tensor_frame.copy()
+                    seq = getattr(self, '_latest_seq', 0)
+                    t_cap_start = getattr(self, '_latest_cap_time', 0.0)
+                    t_cap_ms = getattr(self, '_latest_cap_ms', 0.0)
+    
+                # Run NPU inference only if tracking is actively engaged
+                if not self.is_tracking_active or not getattr(self, 'current_prompt', None):
+                    self._latest_detections = []
+                    time.sleep(0.05)
+                    continue
+
+                t_npu_start = time.perf_counter()
                 h, w = infer_frame.shape[:2]
                 rgb_frame = cv2.cvtColor(infer_frame, cv2.COLOR_BGR2RGB)
                 blob = np.transpose(rgb_frame, (2, 0, 1))
@@ -573,6 +557,8 @@ class VisionVLMAgent:
             sleep_time = max(0.0, self.infer_throttle_sec - elapsed)
             if sleep_time > 0:
                 time.sleep(sleep_time)
+            
+
 
     def _process_servo_tracking_step_instrumented(self, w, h):
         err_x, err_y = 0.0, 0.0
@@ -593,8 +579,8 @@ class VisionVLMAgent:
 
         with self._tracking_lock:
             if self.locked_target_bbox is None:
-                self._prev_error_x = 0.0
-                self._prev_error_y = 0.0
+                self._prev_error_x = None
+                self._prev_error_y = None
                 return err_x, err_y, pd_p, pd_d, at_limit
                 
             sx, sy, sw, sh = self.locked_target_bbox
@@ -615,6 +601,8 @@ class VisionVLMAgent:
 
         # --- PAN CONTROLLER ---
         if abs(error_x) > self.deadband_x:
+            if self._prev_error_x is None:
+                self._prev_error_x = error_x
             d_err_x = (error_x - self._prev_error_x) / dt
             pd_p = (self.kp_pan * error_x)
             pd_d = (self.kd_pan * d_err_x)
@@ -635,6 +623,8 @@ class VisionVLMAgent:
 
         # --- TILT CONTROLLER ---
         if abs(error_y) > self.deadband_y:
+            if self._prev_error_y is None:
+                self._prev_error_y = error_y
             d_err_y = (error_y - self._prev_error_y) / dt
             pd_out_y = (self.kp_tilt * error_y) + (self.kd_tilt * d_err_y)
 
@@ -689,6 +679,8 @@ class VisionVLMAgent:
         return [max(0, fx), max(0, fy), max(20, fw), max(20, fh)]
 
     def _select_locked_target(self, candidate_detections, prompt):
+        if not prompt:
+            return None
         target_lower = prompt.lower()
         matching_boxes = []
 
@@ -914,33 +906,11 @@ class VisionVLMAgent:
         return frame
 
     async def start(self):
-        cam_idx = self.camera_index
-        if isinstance(cam_idx, str) and cam_idx.isdigit():
-            cam_idx = int(cam_idx)
+        if self._camera_running:
+            return True
 
-        # Initialize camera on the main thread to avoid OpenCV threading issues on Linux
-        self._cap = cv2.VideoCapture(cam_idx)
-        
-        if not self._cap.isOpened() and isinstance(cam_idx, int):
-            dev_path = f"/dev/video{cam_idx}"
-            logger.warning(f"[VisionAgent]: Default backend failed. Attempting explicit path: {dev_path} (V4L2)...")
-            self._cap = cv2.VideoCapture(dev_path, cv2.CAP_V4L2)
-            
-            if not self._cap.isOpened():
-                logger.warning(f"[VisionAgent]: V4L2 failed. Attempting GStreamer pipeline...")
-                gstreamer_pipeline = f"v4l2src device={dev_path} ! videoconvert ! appsink"
-                self._cap = cv2.VideoCapture(gstreamer_pipeline, cv2.CAP_GSTREAMER)
-
-        if not self._cap.isOpened():
-            logger.error(f"[VisionAgent]: CRITICAL ERROR - Camera {cam_idx} could not be opened.")
+        if not self._cap.start():
             return False
-
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
-        self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        logger.info(f"[VisionAgent]: Camera hardware engaged at {self.frame_width}x{self.frame_height} @ {self.target_fps} FPS.")
 
         self._camera_running = True
         self._infer_running = True
