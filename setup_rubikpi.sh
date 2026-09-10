@@ -47,4 +47,4 @@ python3 -c "import onnxruntime as ort; eps = ort.get_available_providers(); prin
 echo ""
 echo "Setup complete! Run:"
 echo "  source venv/bin/activate"
-echo "  python src/main.py"
+echo "  python3 main.py"

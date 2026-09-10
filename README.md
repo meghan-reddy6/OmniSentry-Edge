@@ -11,7 +11,20 @@
 
 ## 🏗️ System Architecture
 
+### Directory Structure
 ```text
+OmniSentry-Edge/
+├── main.py
+├── config.yaml
+├── requirements.txt
+└── src/
+    ├── common/        # EventBus and logging telemetry
+    ├── hardware/      # CameraStream (V4L2) and PCA9685Direct
+    ├── agents/        # Vision, Audio, and Orchestrator state machines
+    └── web/           # FastAPI MJPG streaming server and WebCLI
+```
+
+### Data Flow
   +-----------------------------------------------------------------------------------+
   |                                PHYSICAL SENSING & I/O                             |
   |  [Stereo Mic Array (ALSA)]       [V4L2 Camera (USB/CSI)]      [PCA9685 I2C Servos]|
@@ -25,7 +38,7 @@
   |  | AudioSensingAgent  |   |        VisionVLMAgent           |  |ServoActuator  |  |
   |  | - 16kHz PyAudio    |   | - 30 FPS Async V4L2 Ingestion   |  | - smbus2 I2C  |  |
   |  | - Dynamic VAD (dB) |   | - QNN HTP (Hexagon UINT8 NPU)   |  | - PID Loop    |  |
-  |  | - GCC-PHAT TDoA    |   | - EMA Bbox Smoothing (α=0.65)   |  | - Deadband    |  |
+  |  | - GCC-PHAT TDoA    |   | - Aspect-Preserving Letterbox   |  | - Deadband    |  |
   |  | - Angle Smoothing  |   | - HTTP 30 FPS MJPEG Stream      |  | - Clamping    |  |
   |  +--------+-----------+   +---------------+-----------------+  +-------^-------+  |
   |           |                               |                            |          |
@@ -62,7 +75,7 @@
 
 ### 1. Hardware Prerequisites
 - **Board**: Thundercomm Rubik Pi 3 (Qualcomm QCS6490 SoC, 8GB LPDDR5).
-- **Camera**: Standard V4L2 USB / MIPI camera (`/dev/video0`).
+- **Camera**: Standard 1280x720 / 640x480 MJPG V4L2 device (`/dev/video0`).
 - **Microphone**: Stereo 2-channel ALSA microphone array.
 - **Actuation**: PCA9685 I2C PWM driver connected to I2C Bus 1 (`/dev/i2c-1`, address 0x40).
   - **Pan (Ch 0)**: Range $0^\circ\text{--}180^\circ$, Base $90^\circ$
@@ -83,13 +96,13 @@ chmod +x setup_rubikpi.sh scripts/compile_qnn_ctx.py
 ```bash
 source venv/bin/activate
 # Standard Dual-Mode (Starts Web Dashboard on port 8080 and keeps terminal quiet)
-python src/main.py
+python3 main.py
 
 # Headless CLI Mode (No web dashboard, interactive terminal only)
-python src/main.py --headless
+python3 main.py --headless
 
 # Debug Mode (Streams verbose logs to stdout)
-python src/main.py --debug
+python3 main.py --debug
 ```
 
 ### 4. Live Web CLI Dashboard
@@ -105,5 +118,5 @@ The premium dashboard provides a real-time MJPEG tracking feed and a WebSocket-p
 | :--- | :--- | :--- |
 | `track <prompt>` | Engages VLM tracking loop for specified target | `track person`, `track cup`, `track face` |
 | `home` | Centers Pan/Tilt servos back to (0.0°, 0.0°) | `home` |
-| `say <phrase>` | Injects a simulated voice transcription | `say track the red bottle` |
+| `goto <pan> <tilt>` | Manually targets servos to absolute degree coordinates | `goto 45 90` |
 | `exit` | Gracefully shuts down all worker threads | `exit` |
