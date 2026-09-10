@@ -203,6 +203,35 @@ from pathlib import Path
 
 from src.hardware.camera import CameraStream
 
+def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
+    """
+    Resizes image to fit inside new_shape while strictly preserving aspect ratio
+    and 100% field of view. Pads remaining margins with neutral gray.
+    """
+    shape = im.shape[:2]  # [height, width]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+
+    # Scale ratio (new / old) -> scales whole image to fit within bounding box
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+
+    # Unpadded new dimensions
+    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+
+    # Divide padding into symmetric halves
+    dw /= 2.0
+    dh /= 2.0
+
+    if shape[::-1] != new_unpad:
+        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+
+    im_padded = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return im_padded, r, (dw, dh)
+
 class VisionVLMAgent:
     def __init__(self, bus, config):
         self.bus = bus
@@ -403,16 +432,8 @@ class VisionVLMAgent:
     
                 consecutive_failures = 0
     
-                # Optimized Center Crop to 1:1 aspect ratio, then resize to 640x640
-                h_raw, w_raw = raw_frame.shape[:2]
-                if w_raw > h_raw:
-                    diff = (w_raw - h_raw) // 2
-                    cropped = raw_frame[:, diff:diff+h_raw]
-                else:
-                    diff = (h_raw - w_raw) // 2
-                    cropped = raw_frame[diff:diff+w_raw, :]
-                
-                optimal_frame = cv2.resize(cropped, (640, 640), interpolation=cv2.INTER_LINEAR)
+                # Full FOV aspect-preserving letterbox to 640x640
+                optimal_frame, ratio, (pad_w, pad_h) = letterbox(raw_frame, new_shape=(640, 640))
                 t_capture_end = time.perf_counter()
     
                 self.frame_seq += 1
@@ -425,6 +446,7 @@ class VisionVLMAgent:
     
                 with self._frame_lock:
                     self._tensor_frame = optimal_frame
+                    self._pad_info = (ratio, pad_w, pad_h)
                     self._latest_cap_time = t_capture_start
                     self._latest_cap_ms = t_cap_ms
                     self._latest_seq = self.frame_seq
@@ -460,6 +482,7 @@ class VisionVLMAgent:
                     seq = getattr(self, '_latest_seq', 0)
                     t_cap_start = getattr(self, '_latest_cap_time', 0.0)
                     t_cap_ms = getattr(self, '_latest_cap_ms', 0.0)
+                    ratio, pad_w, pad_h = getattr(self, "_pad_info", (1.0, 0.0, 0.0))
     
                 # Run NPU inference only if tracking is actively engaged
                 is_active = self.is_tracking_active and getattr(self, 'current_prompt', None)
@@ -502,6 +525,12 @@ class VisionVLMAgent:
             with self._tracking_lock:
                 if matched is not None:
                     bx, by, bw, bh = matched
+                    # Clamp bounding box strictly inside active (unpadded) image region
+                    bx = max(int(pad_w), min(w - int(pad_w) - 1, bx))
+                    by = max(int(pad_h), min(h - int(pad_h) - 1, by))
+                    bw = max(1, min(w - int(pad_w) - bx, bw))
+                    bh = max(1, min(h - int(pad_h) - by, bh))
+
                     conf = getattr(self, "_last_match_conf", 0.90) # Dummy placeholder for confidence
                     raw_box = np.array([bx, by, bw, bh], dtype=np.float32)
                     if self.smooth_box is None:
@@ -549,14 +578,24 @@ class VisionVLMAgent:
                 cv2.rectangle(model_view, (bx, by), (bx + bw, by + bh), (0, 255, 128), 2)
                 cv2.putText(
                     model_view,
-                    f"NPU IN: {self.current_prompt} ({t_npu_ms:.1f}ms)",
-                    (bx, max(20, by - 6)),
+                    f"TARGET: {self.current_prompt} ({t_npu_ms:.1f}ms)",
+                    (bx, max(int(pad_h) + 16, by - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (0, 255, 128),
                     2
                 )
                 cv2.drawMarker(model_view, (bx + bw // 2, by + bh // 2), (0, 0, 255), cv2.MARKER_CROSS, 14, 2)
+            else:
+                cv2.putText(
+                    model_view,
+                    "FULL FOV // LETTERBOX STANDBY",
+                    (20, int(pad_h) + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 220, 255),
+                    1
+                )
 
             # Center optical target marker (320, 320)
             cv2.drawMarker(model_view, (320, 320), (255, 255, 0), cv2.MARKER_TILTED_CROSS, 12, 1)
