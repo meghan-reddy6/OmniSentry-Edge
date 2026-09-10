@@ -1,149 +1,174 @@
-"""
-Audio Sensing Agent Module
-
-Executes Phase-Delay Acoustic Direction-of-Arrival (TDoA / GCC-PHAT) localization
-using a stereo microphone array via PyAudio. Dynamically filters out ambient noise 
-using a calibrated Voice Activity Detection (VAD) threshold and computes the azimuth angle 
-for acoustic seeking.
-"""
 import time
-import math
 import logging
 import threading
 import numpy as np
-import pyaudio
-from src.common.bus import Event
+import sounddevice as sd
+import onnxruntime as ort
+from src.common.bus import VoiceDetectedEvent, MoveServoCommand
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("AudioAgent")
 
-class SoundLocalizedEvent(Event):
-    def __init__(self, angle: float, volume: float, confidence: float):
-        self.angle = angle
-        self.volume = volume
-        self.confidence = confidence
+def gcc_phat(sig, refsig, fs=16000, max_tau=None, interp=16):
+    """Calculates Generalized Cross-Correlation with Phase Transform (GCC-PHAT)."""
+    n = sig.shape[0] + refsig.shape[0]
+    SIG = np.fft.rfft(sig, n=n)
+    REFSIG = np.fft.rfft(refsig, n=n)
+    R = SIG * np.conj(REFSIG)
+    cc = np.fft.irfft(R / (np.abs(R) + 1e-15), n=(interp * n))
+    max_shift = int(interp * n / 2)
+    if max_tau:
+        max_shift = np.minimum(int(interp * fs * max_tau), max_shift)
 
-class AudioTelemetryEvent(Event):
-    def __init__(self, current_db: float, noise_floor: float):
-        self.current_db = current_db
-        self.noise_floor = noise_floor
+    cc = np.concatenate((cc[-max_shift:], cc[:max_shift + 1]))
+    shift = np.argmax(np.abs(cc)) - max_shift
+    tau = shift / float(interp * fs)
+    return tau
 
 class AudioSensingAgent:
-    """
-    AudioSensingAgent:
-    - Captures stereo audio frames asynchronously at 16kHz via V4L2/ALSA PyAudio.
-    - Continuously computes environmental RMS dB and dynamically gates processing (VAD).
-    - Utilizes GCC-PHAT to extract inter-channel phase shifts and convert to spatial angle (θ).
-    - Emits SoundLocalizedEvent and AudioTelemetryEvent over the async event bus.
-    """
     def __init__(self, bus, config):
         self.bus = bus
         self.config = config
 
-        aud_cfg = self.config.get("audio", {})
-        self.device_index = aud_cfg.get("device_index", None)
-        self.sample_rate = aud_cfg.get("sample_rate", 16000)
-        self.channels = aud_cfg.get("channels", 2)
-        self.chunk_size = aud_cfg.get("chunk_size", 1024)
-        self.mic_distance = aud_cfg.get("mic_distance_meters", 0.065)
-        self.vad_threshold = aud_cfg.get("vad_threshold_db", -20.0)
-        self.min_confidence = aud_cfg.get("min_confidence", 0.45)
-        self.cooldown_sec = aud_cfg.get("cooldown_sec", 0.25)
+        audio_cfg = self.config.get("audio", {})
+        hw_cfg = audio_cfg.get("hardware", {})
+        kws_cfg = audio_cfg.get("kws", {})
 
-        self._running = False
-        self._audio_thread = None
-        self._last_event_time = 0.0
-        self._smoothed_angle = 0.0
+        self.sample_rate = hw_cfg.get("sample_rate", 16000)
+        self.channels = hw_cfg.get("channels", 2)
+        self.chunk_size = hw_cfg.get("chunk_size", 1024)
+        self.mic_dist = hw_cfg.get("mic_distance_meters", 0.065)
+        self.sound_speed = 343.0  # m/s
 
-    def _gcc_phat(self, sig1, sig2, max_tau=None):
-        n = len(sig1) + len(sig2)
-        SIG1 = np.fft.rfft(sig1, n=n)
-        SIG2 = np.fft.rfft(sig2, n=n)
-        R = SIG1 * np.conj(SIG2)
-        cc = np.fft.irfft(R / (np.abs(R) + 1e-15), n=n)
-        max_shift = int(n / 2)
-        cc = np.concatenate((cc[-max_shift:], cc[:max_shift + 1]))
-        shift = np.argmax(cc) - max_shift
-        confidence = float(np.max(cc))
-        return shift, confidence
+        self.conf_threshold = kws_cfg.get("confidence_threshold", 0.78)
+        self.window_samples = int(self.sample_rate * kws_cfg.get("window_duration_sec", 1.0))
+        self.slide_samples = int(self.sample_rate * kws_cfg.get("slide_interval_sec", 0.20))
+        self.target_labels = kws_cfg.get("target_labels", ["omnisentry"])
 
-    def _audio_worker(self):
-        p = pyaudio.PyAudio()
-        stream = None
+        self._audio_buffer = np.zeros((self.window_samples, self.channels), dtype=np.float32)
+        self._buffer_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.stream = None
 
-        target_idx = self.device_index
-        if target_idx is None:
-            for i in range(p.get_device_count()):
-                dev = p.get_device_info_by_index(i)
-                if dev.get("maxInputChannels", 0) >= 1:
-                    target_idx = i
-                    break
+        # Initialize ONNX Session with Providers
+        model_path = kws_cfg.get("model_path", "models/kws_model.onnx")
+        providers = [kws_cfg.get("execution_provider", "QNNExecutionProvider"), "CPUExecutionProvider"]
+        try:
+            self.session = ort.InferenceSession(model_path, providers=providers)
+            logger.info(f"[AudioAgent] KWS Session loaded: {model_path} with {self.session.get_providers()}")
+        except Exception as e:
+            logger.warning(f"[AudioAgent] Preferred provider failed, falling back strictly to CPU: {e}")
+            self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+
+        self.input_name = self.session.get_inputs()[0].name
+        self.input_dtype = self.session.get_inputs()[0].type
+        self.input_shape = self.session.get_inputs()[0].shape
+        self.device_idx = hw_cfg.get("device_index")
+        self._worker_thread = None
+
+    def _start_hardware_stream(self, device_idx):
+        def _audio_callback(indata, frames, time_info, status):
+            if status:
+                logger.warning(f"[AudioAgent] Stream status: {status}")
+            with self._buffer_lock:
+                # Roll buffer and insert new chunk
+                self._audio_buffer = np.roll(self._audio_buffer, -frames, axis=0)
+                self._audio_buffer[-frames:, :] = indata
 
         try:
-            dev_info = p.get_device_info_by_index(target_idx)
-            input_channels = min(self.channels, dev_info.get("maxInputChannels", 1))
-            stream = p.open(
-                format=pyaudio.paInt16,
-                channels=input_channels,
-                rate=self.sample_rate,
-                input=True,
-                input_device_index=target_idx,
-                frames_per_buffer=self.chunk_size
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                device=device_idx,
+                blocksize=self.chunk_size,
+                callback=_audio_callback,
+                dtype="float32"
             )
-            logger.info(f"[AudioAgent]: Mic initialized (Index: {target_idx}, Channels: {input_channels})")
+            self.stream.start()
+            logger.info(f"[AudioAgent] Mic stream started: {self.channels}ch @ {self.sample_rate}Hz")
         except Exception as e:
-            logger.warning(f"[AudioAgent]: Hardware audio capture unavailable: {e}. Running in simulation.")
-            p.terminate()
-            return
+            logger.error(f"[AudioAgent] Failed to open microphone input stream: {e}")
+            self.stream = None
 
-        while self._running:
+    def _calculate_azimuth(self, ch0, ch1):
+        """Calculates DOA angle in degrees using dual-channel TDOA."""
+        max_tau = self.mic_dist / self.sound_speed
+        tau = gcc_phat(ch0, ch1, fs=self.sample_rate, max_tau=max_tau)
+        sin_angle = np.clip((tau * self.sound_speed) / self.mic_dist, -1.0, 1.0)
+        angle_deg = np.degrees(np.arcsin(sin_angle))
+
+        if angle_deg < -15.0:
+            dir_label = "LEFT"
+        elif angle_deg > 15.0:
+            dir_label = "RIGHT"
+        else:
+            dir_label = "CENTER"
+        return dir_label, float(angle_deg)
+
+    def _prepare_tensor(self, raw_audio_1d):
+        """Prepares input array matching the ONNX input node shape and quantization type."""
+        # Scale to uint8 if requested by the quantized ONNX graph
+        if "uint8" in self.input_dtype:
+            # Map [-1.0, 1.0] -> [0, 255]
+            quantized = np.clip((raw_audio_1d + 1.0) * 127.5, 0, 255).astype(np.uint8)
+            tensor = np.reshape(quantized, self.input_shape)
+        else:
+            tensor = np.reshape(raw_audio_1d.astype(np.float32), self.input_shape)
+        return tensor
+
+    def _kws_worker(self):
+        while not self._stop_event.is_set():
+            time.sleep(self.slide_samples / self.sample_rate)
+
             try:
-                data = stream.read(self.chunk_size, exception_on_overflow=False)
-                audio_data = np.frombuffer(data, dtype=np.int16)
+                with self._buffer_lock:
+                    chunk = self._audio_buffer.copy()
 
-                rms = np.sqrt(np.mean(audio_data.astype(np.float32)**2)) + 1e-6
-                volume_db = 20 * np.log10(rms / 32768.0)
+                ch0 = chunk[:, 0]
+                # Verify minimum energy above noise floor before running inference
+                rms = np.sqrt(np.mean(ch0 ** 2))
+                if rms < 0.015:
+                    continue
 
-                self.bus.publish(AudioTelemetryEvent(current_db=volume_db, noise_floor=self.vad_threshold))
+                input_tensor = self._prepare_tensor(ch0)
+                outputs = self.session.run(None, {self.input_name: input_tensor})
+                probs = outputs[0][0]  # Assumes shape [1, num_classes]
 
-                if volume_db > self.vad_threshold and input_channels >= 2:
-                    sig1 = audio_data[0::2]
-                    sig2 = audio_data[1::2]
-                    shift, confidence = self._gcc_phat(sig1, sig2)
+                score = float(np.max(probs))
+                pred_idx = int(np.argmax(probs))
 
-                    speed_of_sound = 343.0
-                    tau = shift / float(self.sample_rate)
-                    safe_mic_dist = max(0.001, float(getattr(self, "mic_distance", 0.065)))
-                    val = (tau * speed_of_sound) / safe_mic_dist
-                    val = max(-1.0, min(1.0, val))
-                    est_angle = math.degrees(math.asin(val))
+                if score >= self.conf_threshold:
+                    # Estimate sound source direction using stereo correlation
+                    dir_label, angle_deg = self._calculate_azimuth(chunk[:, 0], chunk[:, 1])
 
-                    curr_time = time.time()
-                    if confidence >= self.min_confidence and (curr_time - self._last_event_time) >= self.cooldown_sec:
-                        self._last_event_time = curr_time
-                        self._smoothed_angle = 0.7 * est_angle + 0.3 * self._smoothed_angle
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(f"[AUDIO ] Localized: {self._smoothed_angle:+05.1f}° | Vol: {volume_db:4.1f}dB | Conf: {confidence:4.2f}")
-                        else:
-                            logger.info(f"[AudioAgent]: Localized Sound -> Angle: {self._smoothed_angle:+.1f}°, Vol: {volume_db:.1f} dB, Conf: {confidence:.2f}")
-                        self.bus.publish(SoundLocalizedEvent(angle=self._smoothed_angle, volume=volume_db, confidence=confidence))
+                    logger.info(
+                        f"[AudioAgent] KEYWORD DETECTED! Class={pred_idx} "
+                        f"Conf={score:.2f} | Direction={dir_label} ({angle_deg:+.1f}°)"
+                    )
+
+                    self.bus.publish(VoiceDetectedEvent(
+                        keyword=self.target_labels[0],
+                        confidence=score,
+                        direction=dir_label,
+                        azimuth_deg=angle_deg
+                    ))
             except Exception as e:
-                logger.error(f"[AudioAgent]: Audio worker exception: {e}")
-                time.sleep(0.05)
+                logger.error(f"[AudioAgent] Inference worker error: {e}", exc_info=True)
+                time.sleep(0.1)
 
-        if stream:
-            stream.stop_stream()
-            stream.close()
-        p.terminate()
-
+    def release(self):
+        self._stop_event.set()
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            
     async def start(self):
-        self._running = True
-        self._audio_thread = threading.Thread(target=self._audio_worker, daemon=True)
-        self._audio_thread.start()
-        logger.info("[AudioAgent]: Audio sensing started.")
-        return True
-
+        self._start_hardware_stream(self.device_idx)
+        self._worker_thread = threading.Thread(target=self._kws_worker, daemon=True, name="AudioKWSWorker")
+        self._worker_thread.start()
+        logger.info("[AudioAgent] Started.")
+        
     async def stop(self):
-        self._running = False
-        if self._audio_thread and self._audio_thread.is_alive():
-            self._audio_thread.join(timeout=1.0)
-        logger.info("[AudioAgent]: Audio sensing stopped.")
+        self.release()
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=1.0)
+        logger.info("[AudioAgent] Stopped.")

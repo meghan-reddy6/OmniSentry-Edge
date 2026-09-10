@@ -7,8 +7,10 @@ from starlette.requests import Request
 import cv2
 import time
 
-from src.common.bus import EventBus, MoveServoCommand
-from src.common.messages import TrackCommand
+from src.common.bus import (
+    EventBus, MoveServoCommand, TrackCommand,
+    OperatingMode, SetOperatingModeCommand, ManualJogCommand, HomeServosCommand
+)
 from pathlib import Path
 
 logger = logging.getLogger("web.server")
@@ -65,7 +67,34 @@ async def websocket_cli(websocket: WebSocket):
             parts = cmd_line.split(maxsplit=1)
             cmd = parts[0].lower()
             
-            if cmd == "track":
+            mode_map = {
+                "terminal": OperatingMode.TERMINAL,
+                "vision": OperatingMode.VISION_ONLY,
+                "audio": OperatingMode.AUDIO_ONLY,
+                "auto": OperatingMode.AUTONOMOUS,
+                "standby": OperatingMode.STANDBY
+            }
+            
+            jog_step = float(_config.get("servos", {}).get("tracking", {}).get("jog_step_deg", 4.0))
+            
+            if cmd == "mode" and len(parts) > 1:
+                target_mode = parts[1].lower()
+                if target_mode in mode_map:
+                    _bus.publish(SetOperatingModeCommand(mode=mode_map[target_mode]))
+                    await websocket.send_text(f"Mode switched to: {target_mode.upper()}")
+                else:
+                    await websocket.send_text(f"Unknown mode. Choose from: {list(mode_map.keys())}")
+                    
+            elif cmd in ("w", "a", "s", "d"):
+                deltas = {"w": (0, -jog_step), "s": (0, jog_step), "a": (jog_step, 0), "d": (-jog_step, 0)}
+                d_pan, d_tilt = deltas[cmd]
+                _bus.publish(ManualJogCommand(pan_delta=d_pan, tilt_delta=d_tilt))
+                await websocket.send_text(f"Jogged {cmd.upper()} (Pan: {d_pan}, Tilt: {d_tilt})")
+                
+            elif cmd == "status":
+                await websocket.send_text("Status printed to orchestrator logs.")
+                
+            elif cmd == "track":
                 if len(parts) < 2:
                     await websocket.send_text("Error: Missing tracking target prompt (e.g. 'track red bottle')")
                     continue
@@ -75,12 +104,10 @@ async def websocket_cli(websocket: WebSocket):
                 await websocket.send_text(f"Tracking initiated for: {prompt}")
                 
             elif cmd == "home":
-                pan_base = float(_config.get("servos", {}).get("pan", {}).get("base_angle", 90.0))
-                tilt_base = float(_config.get("servos", {}).get("tilt", {}).get("base_angle", 70.0))
-                logger.info(f"WebCLI: HOME -> Pan: {pan_base}°, Tilt: {tilt_base}°")
-                _bus.publish(TrackCommand(prompt=""))
-                _bus.publish(MoveServoCommand(pan=pan_base, tilt=tilt_base))
+                logger.info(f"WebCLI: HOME")
+                _bus.publish(HomeServosCommand())
                 await websocket.send_text("Returned to home position.")
+                
             elif cmd == "goto" or cmd == "move":
                 if len(parts) == 2:
                     coords = parts[1].split()
@@ -100,7 +127,7 @@ async def websocket_cli(websocket: WebSocket):
                     await websocket.send_text("Usage: goto <pan> <tilt> (e.g. 'goto 120 70')")
                     
             else:
-                await websocket.send_text(f"Unknown command: '{cmd}'. Available: track, home, goto, say")
+                await websocket.send_text(f"Unknown command: '{cmd}'. Available: mode, w, a, s, d, track, home, goto, status")
                 
     except WebSocketDisconnect:
         logger.info("WebCLI client disconnected")

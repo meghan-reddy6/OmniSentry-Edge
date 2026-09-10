@@ -290,8 +290,8 @@ class VisionVLMAgent:
         self.update_interval = float(track_cfg.get("update_interval_sec", 0.045))
 
         # Loop state
-        self._prev_error_x = 0.0
-        self._prev_error_y = 0.0
+        self._prev_error_x = None
+        self._prev_error_y = None
         self._last_servo_cmd_time = 0.0
         self.smooth_box = None
 
@@ -361,24 +361,26 @@ class VisionVLMAgent:
 
     def handle_track_command(self, event):
         prompt = getattr(event, 'prompt', None)
-        if prompt and prompt.strip():
-            self.set_track_prompt(str(prompt))
+        if isinstance(prompt, str) and prompt.strip():
+            self.set_track_prompt(prompt)
         else:
             self.stop_tracking()
 
     def set_track_prompt(self, prompt: str):
         cleaned = prompt.strip().lower()
-        self.current_prompt = cleaned
-        self.is_tracking_active = True
-        self.locked_target_bbox = None
-        self.lock_lost_timestamp = None
-        logger.info(f"[VisionAgent]: Active tracking ENGAGED for target: '{self.current_prompt}'")
+        with self._tracking_lock:
+            self.current_prompt = cleaned
+            self.is_tracking_active = True
+            self.locked_target_bbox = None
+            self.lock_lost_timestamp = None
+        logger.info(f"[VisionAgent]: Active tracking ENGAGED for target: '{cleaned}'")
 
     def stop_tracking(self):
-        self.current_prompt = None
-        self.is_tracking_active = False
-        self.locked_target_bbox = None
-        self.lock_lost_timestamp = None
+        with self._tracking_lock:
+            self.current_prompt = None
+            self.is_tracking_active = False
+            self.locked_target_bbox = None
+            self.lock_lost_timestamp = None
         logger.info("[VisionAgent]: Tracking STOPPED. Gimbal locked in Standby.")
 
     def format_telemetry_line(self, seq, t_cap, t_npu, t_total, target, box, conf, err_x, err_y, 
@@ -812,8 +814,8 @@ class VisionVLMAgent:
                 self.locked_target_bbox = None
                 self.current_target_bbox = None
                 self.smooth_box = None
-                self._prev_error_x = 0.0
-                self._prev_error_y = 0.0
+                self._prev_error_x = None
+                self._prev_error_y = None
             return
 
         self.lock_lost_timestamp = None

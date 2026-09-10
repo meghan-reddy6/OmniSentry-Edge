@@ -38,6 +38,7 @@ class ServoActuatorAgent:
         self._init_hardware()
 
         self.bus.subscribe("MoveServoCommand", self.handle_move_command)
+        self.bus.subscribe("HomeServosCommand", self.handle_home_command)
 
     def _init_hardware(self):
         if self.mode == "simulation":
@@ -56,6 +57,9 @@ class ServoActuatorAgent:
         target_pan = getattr(event, "pan", self.current_pan)
         target_tilt = getattr(event, "tilt", self.current_tilt)
         self.set_angles(target_pan, target_tilt)
+
+    def handle_home_command(self, event):
+        self.home()
 
     def set_angles(self, pan_angle, tilt_angle):
         # 1. Round to strict integer degrees

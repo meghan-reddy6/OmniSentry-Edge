@@ -14,6 +14,29 @@ logger = logging.getLogger(__name__)
 class Event:
     pass
 
+from enum import Enum
+from dataclasses import dataclass
+
+class OperatingMode(str, Enum):
+    TERMINAL = "TERMINAL"        # Full manual control (WASD / explicit angles)
+    VISION_ONLY = "VISION_ONLY"  # Autonomous visual tracking without audio wake
+    AUDIO_ONLY = "AUDIO_ONLY"    # Directional sound tracking without visual loop
+    AUTONOMOUS = "AUTONOMOUS"    # Full dual-mic wake -> visual acquisition
+    STANDBY = "STANDBY"          # Idling with servos homed
+
+@dataclass
+class SetOperatingModeCommand(Event):
+    mode: OperatingMode
+
+@dataclass
+class ManualJogCommand(Event):
+    pan_delta: float
+    tilt_delta: float
+
+@dataclass
+class HomeServosCommand(Event):
+    pass
+
 class TrackCommand(Event):
     def __init__(self, prompt: str = ""):
         self.prompt = prompt
@@ -37,6 +60,13 @@ class AudioTelemetryEvent(Event):
     def __init__(self, current_db: float, noise_floor: float):
         self.current_db = current_db
         self.noise_floor = noise_floor
+
+class VoiceDetectedEvent(Event):
+    def __init__(self, keyword: str, confidence: float, direction: str, azimuth_deg: float):
+        self.keyword = keyword
+        self.confidence = confidence
+        self.direction = direction
+        self.azimuth_deg = azimuth_deg
 
 class EventBus:
     def __init__(self):

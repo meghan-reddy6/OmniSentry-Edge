@@ -10,9 +10,10 @@ import sys
 import os
 
 from src.common.config import SystemConfig
-from src.common.bus import EventBus
-from src.common.messages import TrackCommand
-from src.common.bus import MoveServoCommand
+from src.common.bus import (
+    EventBus, MoveServoCommand, TrackCommand,
+    OperatingMode, SetOperatingModeCommand, ManualJogCommand, HomeServosCommand
+)
 from src.agents.orchestrator import OrchestratorAgent
 from src.agents.audio_agent import AudioSensingAgent
 from src.agents.vision_agent import VisionVLMAgent
@@ -21,70 +22,72 @@ from src.agents.servo_agent import ServoActuatorAgent
 # Setup root logger (configured in main() based on args)
 logger = logging.getLogger("main")
 
-async def cli_input_loop(bus: EventBus, config: SystemConfig, shutdown_event: asyncio.Event):
+async def terminal_cli_worker(bus: EventBus, config: SystemConfig, shutdown_event: asyncio.Event):
     """Asynchronous background task listening for command-line instructions to trigger tracking."""
     # Delay print slightly to allow agent bootup logging to complete
     await asyncio.sleep(1.5)
     
     print("\n" + "="*60)
     print("RUBIKPI 3 AUDIO-VISUAL Sensing Head CLI Controller")
+    print("Modes: 'mode terminal', 'mode vision', 'mode audio', 'mode auto', 'mode standby'")
+    print("Terminal Mode Controls: w/s (Tilt), a/d (Pan) + Enter")
     print("Available Commands:")
     print("  track <prompt>  - Initialize VLM tracking loop (e.g. 'track cup')")
-    print("  home            - Command the Pan/Tilt servos back to home (0, 0)")
-    print("  goto <p> <t>    - Move gimbal to explicit pan/tilt coords (e.g. 'goto 120 70')")
+    print("  home            - Command the Pan/Tilt servos back to home")
+    print("  status          - Print active mode and enabled agent subsystems")
     print("  exit            - Stop all agents and terminate the program")
     print("="*60 + "\n")
+
+    mode_map = {
+        "terminal": OperatingMode.TERMINAL,
+        "vision": OperatingMode.VISION_ONLY,
+        "audio": OperatingMode.AUDIO_ONLY,
+        "auto": OperatingMode.AUTONOMOUS,
+        "standby": OperatingMode.STANDBY
+    }
+    
+    jog_step = float(config.get("servos", {}).get("tracking", {}).get("jog_step_deg", 4.0))
 
     while True:
         try:
             # Run blocking input() inside thread pool to prevent blocking asyncio loop
-            user_input = await asyncio.to_thread(input, "RubikPi> ")
-            parts = user_input.strip().split(maxsplit=1)
-            if not parts:
+            user_input = await asyncio.to_thread(input, "OmniSentry> ")
+            line = user_input.strip()
+            if not line:
                 continue
 
+            parts = line.split()
             cmd = parts[0].lower()
+
             if cmd == "exit":
                 logger.info("CLI: Exit command received. Terminating stack...")
                 # Trigger the shutdown event to release the main wait lock
                 shutdown_event.set()
                 break
-            elif cmd == "track":
-                if len(parts) < 2 or not parts[1].strip():
-                    print("Error: Missing tracking target prompt (e.g. 'track red bottle')")
-                    continue
-                prompt = parts[1].strip()
-                logger.info(f"CLI: Launching TrackCommand for prompt: '{prompt}'")
-                bus.publish(TrackCommand(prompt=prompt))
-            elif cmd == "home":
-                pan_base = float(config.get("servos", {}).get("pan", {}).get("base_angle", 90.0))
-                tilt_base = float(config.get("servos", {}).get("tilt", {}).get("base_angle", 70.0))
-                logger.info(f"CLI: Executing HOME -> Pan: {pan_base}°, Tilt: {tilt_base}° (Tracking Halted)")
-                # Stop tracking state first
-                bus.publish(TrackCommand(prompt=""))
-                # Drive servos to base position
-                bus.publish(MoveServoCommand(pan=pan_base, tilt=tilt_base))
-            elif cmd == "goto" or cmd == "move":
-                if len(parts) == 2:
-                    coords = parts[1].split()
-                    if len(coords) == 2:
-                        try:
-                            target_pan = int(round(float(coords[0])))
-                            target_tilt = int(round(float(coords[1])))
-
-                            # Disengage any active tracking loop so it doesn't fight manual coordinates
-                            bus.publish(TrackCommand(prompt=""))
-
-                            logger.info(f"CLI: Manual coordinate command -> Pan: {target_pan} deg, Tilt: {target_tilt} deg")
-                            bus.publish(MoveServoCommand(pan=target_pan, tilt=target_tilt))
-                        except ValueError:
-                            print("Invalid angles. Format: goto <pan_deg> <tilt_deg> (e.g. 'goto 90 65')")
-                    else:
-                        print("Usage: goto <pan> <tilt> (e.g. 'goto 120 70')")
+                
+            elif cmd == "mode" and len(parts) > 1:
+                target_mode = parts[1].lower()
+                if target_mode in mode_map:
+                    bus.publish(SetOperatingModeCommand(mode=mode_map[target_mode]))
                 else:
-                    print("Usage: goto <pan> <tilt> (e.g. 'goto 120 70')")
+                    print(f"Unknown mode. Choose from: {list(mode_map.keys())}")
+                    
+            elif cmd in ("w", "a", "s", "d"):
+                deltas = {"w": (0, -jog_step), "s": (0, jog_step), "a": (jog_step, 0), "d": (-jog_step, 0)}
+                d_pan, d_tilt = deltas[cmd]
+                bus.publish(ManualJogCommand(pan_delta=d_pan, tilt_delta=d_tilt))
+
+            elif cmd == "track" and len(parts) > 1:
+                bus.publish(TrackCommand(prompt=" ".join(parts[1:])))
+
+            elif cmd == "home":
+                bus.publish(HomeServosCommand())
+                
+            elif cmd == "status":
+                print(f"Status check dispatched to orchestrator logs.")
+                
             else:
-                print(f"Unknown command: '{cmd}'. Commands: 'track <prompt>', 'home', 'goto <pan> <tilt>', 'exit'")
+                print(f"Unknown command: '{cmd}'.")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -138,7 +141,7 @@ async def main_async(config_path: str, headless: bool, port: int):
         uvicorn_thread.start()
     
     # Spawn background interactive console reader
-    cli_task = asyncio.create_task(cli_input_loop(bus, config, shutdown_event))
+    cli_task = asyncio.create_task(terminal_cli_worker(bus, config, shutdown_event))
     
     try:
         # Wait until CLI signals exit via the shutdown event

@@ -8,8 +8,8 @@ system:
 vision:
   camera:
     index: 2
-    width: 640
-    height: 480
+    width: 1280
+    height: 720
     fps: 30
     fourcc: "MJPG"
     flip_horizontal: false
@@ -31,15 +31,20 @@ vision:
     inference_fps_limit: 20
 
 audio:
-  device_index: null            # null = auto-detect active microphone
-  sample_rate: 16000
-  channels: 2
-  chunk_size: 1024
-  mic_distance_meters: 0.065
-  vad_threshold_db: -20.0
-  min_confidence: 0.45
-  cooldown_sec: 0.25
-  calibrate_ambient_noise: true
+  hardware:
+    device_index: null       # null defaults to ALSA default; or set to specific card index
+    sample_rate: 16000       # Sensor sample rate (typically 16000 or 48000)
+    channels: 2              # Stereo dual-mic array
+    chunk_size: 1024         # Buffer read size
+    mic_distance_meters: 0.065 # Physical separation between mic capsules (e.g., 65mm)
+
+  kws:
+    model_path: "models/kws_model.onnx"
+    confidence_threshold: 0.78
+    window_duration_sec: 1.0
+    slide_interval_sec: 0.20
+    target_labels: ["hey_ruby"]
+    execution_provider: "QNNExecutionProvider" # Fallbacks to CPUExecutionProvider
 
 servos:
   mode: "hardware"
@@ -71,6 +76,7 @@ servos:
     max_step_deg: 5.0
     min_breakaway_deg: 0.0
     update_interval_sec: 0.045
+    jog_step_deg: 4.0
 
 orchestrator:
   auto_track_speaker: false
