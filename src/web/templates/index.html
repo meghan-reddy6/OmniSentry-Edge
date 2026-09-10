@@ -109,13 +109,23 @@
             justify-content: space-between;
         }
 
-        .video-feed {
+        .stream-container {
             width: 100%;
-            height: auto;
-            object-fit: contain;
-            aspect-ratio: 1 / 1;
-            background-color: #000;
-            z-index: 1;
+            max-width: 640px;
+            aspect-ratio: 1 / 1; /* Enforces true 1:1 square display */
+            background: #05080f;
+            border-radius: 6px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: auto;
+        }
+
+        .stream-container img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain; /* Prevents CSS clipping/cropping */
             display: block;
         }
 
@@ -223,7 +233,9 @@
                 <span>MJPEG Stream</span>
                 <span>VisionVLMAgent</span>
             </div>
-            <img id="video_feed" class="video-feed" src="/video_feed" alt="Camera Feed Offline">
+            <div class="stream-container">
+                <img id="mjpg-stream" src="/video_feed" alt="OmniSentry Stream" />
+            </div>
         </div>
 
         <div class="cli-container">

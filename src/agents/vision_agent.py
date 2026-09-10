@@ -569,51 +569,53 @@ class VisionVLMAgent:
                     )
                     logger.debug(line)
 
-            # Burn debug telemetry directly onto the 640x640 tensor view
-            model_view = infer_frame.copy()
+            # Build single clean preview
+            display_frame = infer_frame.copy()
 
-            # Target annotations
-            if self.locked_target_bbox is not None:
+            # Active Target Bounding Box
+            if is_active and self.locked_target_bbox is not None:
                 bx, by, bw, bh = self.locked_target_bbox
-                cv2.rectangle(model_view, (bx, by), (bx + bw, by + bh), (0, 255, 128), 2)
+                cv2.rectangle(display_frame, (bx, by), (bx + bw, by + bh), (0, 255, 128), 2)
                 cv2.putText(
-                    model_view,
-                    f"TARGET: {self.current_prompt} ({t_npu_ms:.1f}ms)",
-                    (bx, max(int(pad_h) + 16, by - 6)),
+                    display_frame,
+                    f"TRACK: {self.current_prompt} ({t_npu_ms:.1f}ms)",
+                    (bx, max(int(pad_h) + 18, by - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
+                    0.55,
                     (0, 255, 128),
                     2
                 )
-                cv2.drawMarker(model_view, (bx + bw // 2, by + bh // 2), (0, 0, 255), cv2.MARKER_CROSS, 14, 2)
+                cv2.drawMarker(display_frame, (bx + bw // 2, by + bh // 2), (0, 0, 255), cv2.MARKER_CROSS, 14, 2)
             else:
+                status_label = f"TRACKING IDLE [{self.current_prompt}]" if is_active else "SYSTEM STANDBY"
                 cv2.putText(
-                    model_view,
-                    "FULL FOV // LETTERBOX STANDBY",
-                    (20, int(pad_h) + 25),
+                    display_frame,
+                    status_label,
+                    (20, int(pad_h) + 26),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
+                    0.55,
                     (0, 220, 255),
-                    1
+                    2
                 )
 
-            # Center optical target marker (320, 320)
-            cv2.drawMarker(model_view, (320, 320), (255, 255, 0), cv2.MARKER_TILTED_CROSS, 12, 1)
+            # Center optical target crosshair (320, 320)
+            cv2.drawMarker(display_frame, (320, 320), (255, 255, 0), cv2.MARKER_TILTED_CROSS, 12, 1)
 
-            # Diagnostic HUD watermark
+            # Clean top HUD banner
+            cv2.rectangle(display_frame, (0, 0), (w, 32), (20, 25, 35), -1)
             cv2.putText(
-                model_view,
-                f"TENSOR: 640x640 (DIRECT STRETCH) | INF: {t_npu_ms:.1f}ms",
-                (15, 25),
+                display_frame,
+                f"TENSOR: 640x640 (LETTERBOX) | NPU: {t_npu_ms:.1f}ms",
+                (12, 22),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 220, 255),
+                0.50,
+                (0, 255, 180),
                 1
             )
 
             # Encode and publish as the active web preview stream
-            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
-            ret_enc, jpeg = cv2.imencode(".jpg", model_view, encode_params)
+            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 75]
+            ret_enc, jpeg = cv2.imencode(".jpg", display_frame, encode_params)
             if ret_enc:
                 with self._frame_lock:
                     self._preview_jpeg = jpeg.tobytes()
