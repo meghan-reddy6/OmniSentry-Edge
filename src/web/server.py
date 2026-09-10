@@ -35,20 +35,28 @@ async def get_dashboard(request: Request):
         html_content = f.read()
     return HTMLResponse(content=html_content)
 
-def generate_frames():
-    """Generator that yields MJPEG frames from the VisionVLMAgent."""
-    while True:
-        if _vision_agent:
-            jpeg_bytes = _vision_agent.get_latest_jpeg()
-            if jpeg_bytes is not None:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
-        time.sleep(1.0 / 30.0)
-
 @app.get("/video_feed")
 async def video_feed():
-    """Streaming endpoint for MJPEG."""
-    return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
+    async def frame_generator():
+        last_frame = None
+        while True:
+            if _vision_agent:
+                frame_bytes = _vision_agent.get_latest_jpeg()
+                if frame_bytes and frame_bytes != last_frame:
+                    last_frame = frame_bytes
+                    yield (b"--frame\r\n"
+                           b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+            await asyncio.sleep(0.015)  # Cap generator at ~60Hz
+
+    response = StreamingResponse(
+        frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["Connection"] = "close"
+    return response
 
 @app.websocket("/ws/cli")
 async def websocket_cli(websocket: WebSocket):

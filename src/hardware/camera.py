@@ -1,50 +1,60 @@
 import cv2
+import time
+import threading
 import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("HardwareCamera")
 
 class CameraStream:
-    def __init__(self, cam_idx=0, width=640, height=480, fps=30):
-        self.cam_idx = cam_idx
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.cap = None
-
-    def start(self):
-        logger.info(f"[CameraStream]: Attempting to open V4L2 camera {self.cam_idx}")
-        self.cap = cv2.VideoCapture(self.cam_idx, cv2.CAP_V4L2)
+    def __init__(self, device_index=2, width=1280, height=720, fps=30, fourcc="MJPG"):
+        self.cap = cv2.VideoCapture(device_index, cv2.CAP_V4L2)
+        if not self.cap.isOpened():
+            logger.warning(f"[CameraStream] V4L2 backend failed on index {device_index}, trying default...")
+            self.cap = cv2.VideoCapture(device_index)
 
         if not self.cap.isOpened():
-            dev_path = f"/dev/video{self.cam_idx}"
-            logger.warning(f"[CameraStream]: Default failed, attempting explicit path {dev_path}")
-            self.cap = cv2.VideoCapture(dev_path, cv2.CAP_V4L2)
-            
-        if not self.cap.isOpened():
-            logger.error(f"[CameraStream]: CRITICAL ERROR - Camera {self.cam_idx} could not be opened.")
-            return False
+            raise RuntimeError(f"FATAL: Unable to open video device on index {device_index}")
 
-        # Apply MJPG explicitly to save bus bandwidth
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
-
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        if fourcc:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        # Log actual negotiated format
-        actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-        logger.info(f"[CameraStream]: Engaged hardware at {actual_w}x{actual_h} @ {actual_fps} FPS.")
-        return True
+        self._latest_raw = None
+        self._lock = threading.Lock()
+        self._running = True
 
-    def read(self):
-        if not self.cap:
-            return False, None
-        return self.cap.read()
+        # Dedicated thread continuously drains the V4L2 driver queue
+        self._drain_thread = threading.Thread(
+            target=self._drain_worker, 
+            daemon=True, 
+            name="V4L2DrainWorker"
+        )
+        self._drain_thread.start()
+        logger.info(f"[CameraStream] Zero-lag capture initialized on dev {device_index} ({width}x{height} @ {fps}FPS)")
+
+    def _drain_worker(self):
+        while self._running:
+            if not self.cap.grab():
+                time.sleep(0.003)
+                continue
+            ret, frame = self.cap.retrieve()
+            if ret and frame is not None:
+                with self._lock:
+                    self._latest_raw = frame
+
+    def read_fresh_frame(self):
+        """Returns the latest frame with zero driver-queue latency."""
+        with self._lock:
+            if self._latest_raw is None:
+                return False, None
+            return True, self._latest_raw.copy()
 
     def release(self):
-        if self.cap:
+        self._running = False
+        if self._drain_thread.is_alive():
+            self._drain_thread.join(timeout=1.0)
+        if self.cap and self.cap.isOpened():
             self.cap.release()

@@ -6,6 +6,11 @@ import sounddevice as sd
 import onnxruntime as ort
 from src.common.bus import VoiceDetectedEvent, MoveServoCommand
 
+try:
+    from python_speech_features import mfcc
+except ImportError:
+    mfcc = None
+
 logger = logging.getLogger("AudioAgent")
 
 def gcc_phat(sig, refsig, fs=16000, max_tau=None, interp=16):
@@ -51,26 +56,52 @@ class AudioSensingAgent:
 
         # Initialize ONNX Session with Providers
         model_path = kws_cfg.get("model_path", "models/kws_model.onnx")
-        providers = [kws_cfg.get("execution_provider", "QNNExecutionProvider"), "CPUExecutionProvider"]
+        
+        qnn_options = {
+            "backend_path": "libQnnHtp.so",
+            "htp_performance_mode": "burst",
+        }
+
+        providers = [
+            ("QNNExecutionProvider", qnn_options),
+            "CPUExecutionProvider"
+        ]
+
         try:
             self.session = ort.InferenceSession(model_path, providers=providers)
-            logger.info(f"[AudioAgent] KWS Session loaded: {model_path} with {self.session.get_providers()}")
+            logger.info(f"[AudioAgent] Initialized KWS session using providers: {self.session.get_providers()}")
         except Exception as e:
-            logger.warning(f"[AudioAgent] Preferred provider failed, falling back strictly to CPU: {e}")
+            logger.error(f"[AudioAgent] Failed to initialize QNN HTP provider: {e}", exc_info=True)
             self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
 
         self.input_name = self.session.get_inputs()[0].name
         self.input_dtype = self.session.get_inputs()[0].type
-        self.input_shape = self.session.get_inputs()[0].shape
+        raw_shape = self.session.get_inputs()[0].shape
+
+        # Sanitize dynamic string/None dimensions into concrete integers
+        sanitized_shape = []
+        for idx, dim in enumerate(raw_shape):
+            if isinstance(dim, int):
+                sanitized_shape.append(dim)
+            elif isinstance(dim, str) or dim is None:
+                # Dynamic batch dimension defaults to 1; inner sequence dimensions infer via -1
+                if idx == 0:
+                    sanitized_shape.append(1)
+                else:
+                    sanitized_shape.append(-1)
+            else:
+                sanitized_shape.append(int(dim))
+
+        self.target_shape = tuple(sanitized_shape)
+        logger.info(f"[AudioAgent] Sanitized ONNX target shape: {self.target_shape} (raw shape was: {raw_shape})")
         self.device_idx = hw_cfg.get("device_index")
         self._worker_thread = None
 
     def _start_hardware_stream(self, device_idx):
         def _audio_callback(indata, frames, time_info, status):
             if status:
-                logger.warning(f"[AudioAgent] Stream status: {status}")
+                logger.warning(f"[AudioAgent] Input stream status: {status}")
             with self._buffer_lock:
-                # Roll buffer and insert new chunk
                 self._audio_buffer = np.roll(self._audio_buffer, -frames, axis=0)
                 self._audio_buffer[-frames:, :] = indata
 
@@ -84,10 +115,21 @@ class AudioSensingAgent:
                 dtype="float32"
             )
             self.stream.start()
-            logger.info(f"[AudioAgent] Mic stream started: {self.channels}ch @ {self.sample_rate}Hz")
+            logger.info(f"[AudioAgent] Hardware audio stream active: {self.channels}ch @ {self.sample_rate}Hz")
         except Exception as e:
-            logger.error(f"[AudioAgent] Failed to open microphone input stream: {e}")
+            logger.warning(f"[AudioAgent] Physical mic input unavailable ({e}). Spawning simulation audio loop...")
             self.stream = None
+            threading.Thread(target=self._simulation_feeder, daemon=True, name="SimAudioFeeder").start()
+
+    def _simulation_feeder(self):
+        """Feeds low-level synthetic baseline noise so downstream inference runs cleanly in simulation."""
+        step_sleep = self.chunk_size / float(self.sample_rate)
+        while not self._stop_event.is_set():
+            time.sleep(step_sleep)
+            sim_chunk = (np.random.randn(self.chunk_size, self.channels) * 0.005).astype(np.float32)
+            with self._buffer_lock:
+                self._audio_buffer = np.roll(self._audio_buffer, -self.chunk_size, axis=0)
+                self._audio_buffer[-self.chunk_size:, :] = sim_chunk
 
     def _calculate_azimuth(self, ch0, ch1):
         """Calculates DOA angle in degrees using dual-channel TDOA."""
@@ -104,16 +146,57 @@ class AudioSensingAgent:
             dir_label = "CENTER"
         return dir_label, float(angle_deg)
 
-    def _prepare_tensor(self, raw_audio_1d):
-        """Prepares input array matching the ONNX input node shape and quantization type."""
-        # Scale to uint8 if requested by the quantized ONNX graph
-        if "uint8" in self.input_dtype:
-            # Map [-1.0, 1.0] -> [0, 255]
-            quantized = np.clip((raw_audio_1d + 1.0) * 127.5, 0, 255).astype(np.uint8)
-            tensor = np.reshape(quantized, self.input_shape)
+    def _extract_mfcc_features(self, audio_1s_mono):
+        """Transforms 1 second of 16kHz audio into a 650-element feature vector."""
+        if mfcc is None:
+            raise RuntimeError("python_speech_features is required for KWS MFCC extraction. Run: pip install python_speech_features")
+
+        # Compute MFCCs: typically yields ~49 frames x 13 coefficients = 637 to 650 features
+        feat = mfcc(
+            audio_1s_mono,
+            samplerate=self.sample_rate,
+            winlen=0.025,
+            winstep=0.020,
+            numcep=13,
+            nfilt=32,
+            nfft=512,
+            preemph=0.97,
+            ceplifter=22,
+            appendEnergy=True
+        )
+        flat_feat = feat.flatten()
+
+        # Exact padding / trimming to match 650 elements
+        target_len = 650
+        if len(flat_feat) < target_len:
+            flat_feat = np.pad(flat_feat, (0, target_len - len(flat_feat)), mode='constant')
         else:
-            tensor = np.reshape(raw_audio_1d.astype(np.float32), self.input_shape)
-        return tensor
+            flat_feat = flat_feat[:target_len]
+
+        return flat_feat
+
+    def _prepare_tensor(self, raw_audio_1d):
+        """Prepares and reshapes the raw audio array to match the target ONNX descriptor."""
+        is_uint8 = "uint8" in self.input_dtype.lower()
+        
+        # 1. Compute MFCC features
+        feat_vector = self._extract_mfcc_features(raw_audio_1d)
+
+        if is_uint8:
+            # Map float features to uint8 range [0, 255]
+            f_min, f_max = feat_vector.min(), feat_vector.max()
+            if f_max > f_min:
+                feat_scaled = (feat_vector - f_min) / (f_max - f_min) * 255.0
+            else:
+                feat_scaled = np.zeros_like(feat_vector)
+            
+            audio_quant = np.clip(feat_scaled, 0, 255).astype(np.uint8)
+            tensor = np.reshape(audio_quant, self.target_shape)
+            return np.ascontiguousarray(tensor, dtype=np.uint8)
+        else:
+            audio_f32 = feat_vector.astype(np.float32)
+            tensor = np.reshape(audio_f32, self.target_shape)
+            return np.ascontiguousarray(tensor, dtype=np.float32)
 
     def _kws_worker(self):
         while not self._stop_event.is_set():

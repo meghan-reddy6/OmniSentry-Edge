@@ -1,5 +1,5 @@
 system:
-  mode: "hardware"              # 'hardware' or 'simulation'
+  mode: "simulation"              # 'hardware' or 'simulation'
   log_level: "INFO"
   enable_diagnostics_stream: true
   diagnostics_port: 8080
@@ -7,7 +7,7 @@ system:
 
 vision:
   camera:
-    index: 2
+    index: 0
     width: 1280
     height: 720
     fps: 30
@@ -67,16 +67,22 @@ servos:
     invert: false
 
   tracking:
-    deadband_x: 0.10
-    deadband_y: 0.10
-    kp_pan: 2.5
-    kd_pan: 0.50
-    kp_tilt: 2.0
-    kd_tilt: 0.40
+    kp_pan: 4.2
+    kd_pan: 0.38
+    kp_tilt: 3.2
+    kd_tilt: 0.28
+    deadband_x: 0.06
+    deadband_y: 0.06
     max_step_deg: 5.0
-    min_breakaway_deg: 0.0
+    min_breakaway_deg: 1.8
     update_interval_sec: 0.045
     jog_step_deg: 4.0
+    loss_recovery:
+      enabled: true
+      lost_frames_threshold: 6
+      search_timeout_sec: 3.5
+      sweep_amplitude_deg: 20.0
+      sweep_frequency_hz: 0.6
 
 orchestrator:
   auto_track_speaker: false
