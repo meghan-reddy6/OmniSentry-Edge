@@ -25,39 +25,40 @@ OmniSentry-Edge/
 ```
 
 ### Data Flow
-  +-----------------------------------------------------------------------------------+
-  |                                PHYSICAL SENSING & I/O                             |
-  |  [Stereo Mic Array (ALSA)]       [V4L2 Camera (USB/CSI)]      [PCA9685 I2C Servos]|
-  +-----------------+--------------------------+---------------------------+----------+
-                    |                          |                           ^
-                    v                          v                           |
-  +-----------------+--------------------------+---------------------------+----------+
-  |                           EDGE AGENT SUBSYSTEMS                                   |
-  |                                                                                   |
-  |  +--------------------+   +---------------------------------+  +---------------+  |
-  |  | AudioSensingAgent  |   |        VisionVLMAgent           |  |ServoActuator  |  |
-  |  | - 16kHz PyAudio    |   | - 30 FPS Async V4L2 Ingestion   |  | - smbus2 I2C  |  |
-  |  | - Dynamic VAD (dB) |   | - QNN HTP (Hexagon UINT8 NPU)   |  | - PID Loop    |  |
-  |  | - GCC-PHAT TDoA    |   | - Aspect-Preserving Letterbox   |  | - Deadband    |  |
-  |  | - Angle Smoothing  |   | - HTTP 30 FPS MJPEG Stream      |  | - Clamping    |  |
-  |  +--------+-----------+   +---------------+-----------------+  +-------^-------+  |
-  |           |                               |                            |          |
-  +-----------|-------------------------------|----------------------------|----------+
-              |                               |                            |
-              v                               v                            |
-  +------------------------------------------------------------------------+----------+
-  |                   THREAD-SAFE ASYNC EVENT BUS (src/common/bus.py)                 |
-  |  Events: SoundLocalizedEvent, VisualTargetOffsetEvent, MoveServoCommand, StateChange|
-  +-----------------------------------+-----------------------------------------------+
-                                      ^
-                                      |
-  +-----------------------------------+-----------------------------------------------+
-  |                 MULTIMODAL ORCHESTRATOR (State Machine Engine)                    |
-  |                                                                                   |
-  |         [ STANDBY / IDLE ]  <=====>  [ ACOUSTIC_SEEK ]                            |
-  |                 ^                            |                                    |
-  |                 +======== [ VLM_TRACKING ] <=+                                    |
-  +-----------------------------------------------------------------------------------+
+```text
++-----------------------------------------------------------------------------------+
+|                              PHYSICAL SENSING & I/O                               |
+|   [Stereo Mic Array (ALSA)]    [V4L2 Camera (USB/CSI)]    [PCA9685 I2C Servos]    |
++-----------------+--------------------------+---------------------------+----------+
+                  |                          |                           ^
+                  v                          v                           |
++-----------------+--------------------------+---------------------------+----------+
+|                              EDGE AGENT SUBSYSTEMS                                |
+|                                                                                   |
+|  +--------------------+  +---------------------------------+  +----------------+  |
+|  | AudioSensingAgent  |  | VisionVLMAgent                  |  | ServoActuator  |  |
+|  | - 48k->16k Resample|  | - 30 FPS Async V4L2 Ingestion   |  | - smbus2 I2C   |  |
+|  | - EdgeImpulse DSP  |  | - QNN HTP (Hexagon UINT8 NPU)   |  | - PID Loop     |  |
+|  | - GCC-PHAT TDoA    |  | - Aspect-Preserving Letterbox   |  | - Deadband     |  |
+|  | - QNN HTP KWS      |  | - HTTP 30 FPS MJPEG Stream      |  | - Clamping     |  |
+|  +--------+-----------+  +----------------+----------------+  +-------^--------+  |
+|           |                               |                           |           |
++-----------|-------------------------------|---------------------------|-----------+
+            |                               |                           |
+            v                               v                           |
++-----------------------------------------------------------------------+-----------+
+|                  THREAD-SAFE ASYNC EVENT BUS (src/common/bus.py)                  |
+|  Events: VoiceDetectedEvent, TrackTargetCommand, MoveServoCommand, OperatingMode  |
++-----------------------------------+-----------------------------------------------+
+                                    ^
+                                    |
++-----------------------------------+-----------------------------------------------+
+|                 MULTIMODAL ORCHESTRATOR (State Machine Engine)                    |
+|                                                                                   |
+|            [ STANDBY / IDLE ] <======> [ ACOUSTIC_SEEK ]                          |
+|                    ^                          |                                   |
+|                    +======== [ VLM_TRACKING ] <                                   |
++-----------------------------------------------------------------------------------+
 ```
 
 ## ⚡ Performance Metrics on Qualcomm QCS6490 (Rubik Pi 3)

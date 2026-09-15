@@ -32,19 +32,20 @@ vision:
 
 audio:
   hardware:
-    device_index: null       # null defaults to ALSA default; or set to specific card index
-    sample_rate: 16000       # Sensor sample rate (typically 16000 or 48000)
-    channels: 2              # Stereo dual-mic array
-    chunk_size: 1024         # Buffer read size
-    mic_distance_meters: 0.065 # Physical separation between mic capsules (e.g., 65mm)
+    device_index: 2            # RubikPi 3 capture hardware index
+    sample_rate: 48000         # Physical mic capture rate (resampled to 16000)
+    channels: 2                # 2-channel input (Ch0 for KWS, Ch0+Ch1 for TDoA)
+    chunk_size: 1024
+    mic_distance_meters: 0.065 # Physical baseline for GCC-PHAT TDoA
 
   kws:
     model_path: "models/kws_model.onnx"
-    confidence_threshold: 0.78
-    window_duration_sec: 1.0
-    slide_interval_sec: 0.20
-    target_labels: ["hey_ruby"]
-    execution_provider: "QNNExecutionProvider" # Fallbacks to CPUExecutionProvider
+    confidence_threshold: 0.70
+    consecutive_hits: 3
+    cooldown_sec: 1.5
+    input_scale: null          # Set numeric float if INT8/UINT8 quantized
+    input_zero_point: null     # Set integer if INT8/UINT8 quantized
+    backend: "htp"             # QNN HTP acceleration
 
 servos:
   mode: "hardware"
