@@ -207,6 +207,13 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="Web server port (default 8080)")
     parser.add_argument("--headless", action="store_true", help="Run terminal CLI only without the web dashboard")
     
+    # Pre-flight hardware checks
+    parser.add_argument(
+        "--check-hardware", 
+        action="store_true", 
+        help="Scan and validate connected cameras, audio devices, and I2C servos before launching."
+    )
+    
     args = parser.parse_args()
     
     # Configure dynamic logging
@@ -221,6 +228,10 @@ def main():
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.WARNING)
         logging.basicConfig(level=logging.INFO, format=log_format, handlers=[file_handler, console_handler])
+        
+    if args.check_hardware:
+        from src.hardware.probe import run_full_probe
+        run_full_probe(update_config=False)
     
     try:
         asyncio.run(main_async(args.config, args.headless, args.port))

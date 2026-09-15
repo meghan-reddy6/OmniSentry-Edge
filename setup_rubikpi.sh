@@ -27,8 +27,9 @@ WHEEL_NAME="onnxruntime_qnn-1.23.0-cp312-cp312-linux_aarch64.whl"
 
 if ! python3 -c "import onnxruntime as ort; assert 'QNNExecutionProvider' in ort.get_available_providers()" 2>/dev/null; then
     echo "Installing official QNN ONNX Runtime wheel..."
+    pip uninstall -y onnxruntime
     wget -q --show-progress -O "$WHEEL_NAME" "$WHEEL_URL"
-    pip install "$WHEEL_NAME" --force-reinstall
+    pip install "$WHEEL_NAME" --force-reinstall --no-deps
     rm -f "$WHEEL_NAME"
 fi
 
