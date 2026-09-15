@@ -198,7 +198,6 @@ class VisionVLMAgent:
         available_eps = ort.get_available_providers()
         qnn_options = {
             "backend_path": npu_cfg.get("backend_path", "/usr/lib/libQnnHtp.so"),
-            "backend_type": npu_cfg.get("backend_type", "htp"),
             "htp_performance_mode": npu_cfg.get("performance_mode", "burst"),
             "profiling_level": "off"
         }

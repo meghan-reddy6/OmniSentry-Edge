@@ -23,7 +23,6 @@ so.add_session_config_entry("ep.context_embed_mode", "1")
 providers = [
     ("QNNExecutionProvider", {
         "backend_path": "/usr/lib/libQnnHtp.so",
-        "backend_type": "htp",
         "htp_performance_mode": "burst",
         "htp_graph_finalization_optimization_mode": "3",
         "profiling_level": "off"
