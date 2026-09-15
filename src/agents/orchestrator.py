@@ -100,13 +100,20 @@ class OrchestratorAgent:
     def _handle_voice_detected(self, event: VoiceDetectedEvent):
         if self.current_mode not in (OperatingMode.AUDIO_ONLY, OperatingMode.AUTONOMOUS):
             return
-            
-        logger.info(f"[Orchestrator] Audio wake received: {event.keyword} from {event.direction} ({event.azimuth_deg:.1f}°)")
-        # Slew pan servo toward detected audio direction
-        pan_offset = -event.azimuth_deg * 0.75  # Proportional directional offset
-        target_pan = float(np.clip(self.current_pan + pan_offset, 10.0, 170.0))
-        self.bus.publish(MoveServoCommand(pan=target_pan, tilt=self.current_tilt))
-        self.current_pan = target_pan
+
+        # Slew pan servo toward sound azimuth (proportional step)
+        pan_offset = -event.azimuth_deg * 0.75
+        new_pan = max(self.pan_min, min(self.pan_max, self.current_pan + pan_offset))
+        new_tilt = self.current_tilt
+
+        logger.info(
+            f"[Orchestrator] Audio Orientation Command: "
+            f"Direction={event.direction} | Offset={pan_offset:+.1f} deg -> "
+            f"New Coordinates: (Pan={new_pan:.1f} deg, Tilt={new_tilt:.1f} deg)"
+        )
+
+        self.current_pan = new_pan
+        self.bus.publish(MoveServoCommand(pan=int(round(new_pan)), tilt=int(round(new_tilt))))
 
     def _handle_set_mode(self, cmd: SetOperatingModeCommand):
         self.current_mode = cmd.mode
@@ -118,6 +125,10 @@ class OrchestratorAgent:
         elif self.current_mode == OperatingMode.STANDBY:
             self.bus.publish(TrackCommand(prompt=""))
             self.bus.publish(HomeServosCommand())
+            
+        # Broadcast the new mode back over the bus so WebUI can reflect it
+        from src.common.bus import OperatingModeChangedEvent
+        self.bus.publish(OperatingModeChangedEvent(mode=self.current_mode.value))
 
     def _handle_manual_jog(self, cmd: ManualJogCommand):
         """Allows direct nudge movements only when in manual terminal mode."""

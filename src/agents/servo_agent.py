@@ -72,10 +72,10 @@ class ServoActuatorAgent:
 
         # Only execute I2C write if angle has changed by at least 1 full degree
         if clamped_pan != self.current_pan or clamped_tilt != self.current_tilt:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"[SERVO ] Write -> Pan:{clamped_pan:3d}° Tilt:{clamped_tilt:3d}° (was P:{int(self.current_pan):3d}° T:{int(self.current_tilt):3d}°)")
+            if self.mode == 'simulation':
+                logger.debug(f"[SERVO ] Write -> Pan:{clamped_pan:3d} deg Tilt:{clamped_tilt:3d} deg (was P:{int(self.current_pan):3d} deg T:{int(self.current_tilt):3d} deg)")
             else:
-                logger.info(f"[ServoAgent] Hardware Write -> Pan: {clamped_pan}°, Tilt: {clamped_tilt}° (was {self.current_pan}°, {self.current_tilt}°)")
+                logger.info(f"[ServoAgent] Hardware Write -> Pan: {clamped_pan} deg, Tilt: {clamped_tilt} deg (was {self.current_pan} deg, {self.current_tilt} deg)")
             self.current_pan = clamped_pan
             self.current_tilt = clamped_tilt
 
@@ -95,7 +95,7 @@ class ServoActuatorAgent:
     def home(self):
         """Restores pan and tilt servos to default base positions."""
         self.set_angles(self.pan_base, self.tilt_base)
-        logger.info(f"[ServoAgent]: Servos homed to Base (Pan: {self.pan_base}°, Tilt: {self.tilt_base}°)")
+        logger.info(f"[ServoAgent]: Servos homed to Base (Pan: {self.pan_base} deg, Tilt: {self.tilt_base} deg)")
 
     async def start(self):
         self.home()

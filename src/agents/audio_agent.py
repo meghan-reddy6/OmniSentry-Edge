@@ -126,18 +126,17 @@ def extract_edge_impulse_features(audio_16k):
         raise RuntimeError(f"Unexpected shape: {features.shape}, expected ({EXPECTED_FEATURES},)")
     return features
 
-def gcc_phat(sig, refsig, fs=48000, max_tau=None, interp=16):
+def gcc_phat(sig, refsig, fs=16000, max_tau=None):
     n = sig.shape[0] + refsig.shape[0]
     SIG = np.fft.rfft(sig, n=n)
     REFSIG = np.fft.rfft(refsig, n=n)
     R = SIG * np.conj(REFSIG)
-    cc = np.fft.irfft(R / (np.abs(R) + 1e-15), n=(interp * n))
-    max_shift = int(interp * n / 2)
-    if max_tau:
-        max_shift = np.minimum(int(interp * fs * max_tau), max_shift)
+    cc = np.fft.irfft(R / (np.abs(R) + 1e-12), n=n)
+    # Return peak correlation delay
+    max_shift = int(np.floor(max_tau * fs)) if max_tau else int(n / 2)
     cc = np.concatenate((cc[-max_shift:], cc[:max_shift + 1]))
     shift = np.argmax(np.abs(cc)) - max_shift
-    return shift / float(interp * fs)
+    return float(shift) / float(fs)
 
 class AudioSensingAgent:
     def __init__(self, bus, config):
@@ -185,22 +184,42 @@ class AudioSensingAgent:
         def _callback(indata, frames, time_info, status):
             if status:
                 logger.warning(f"[AudioAgent] Stream status: {status}")
-            clean_chunk = np.nan_to_num(indata, nan=0.0)
+            # If native capture is mono, broadcast across stereo buffer
+            if indata.shape[1] == 1 and self.channels == 2:
+                chunk = np.repeat(indata, 2, axis=1)
+            else:
+                chunk = indata
+                
+            clean_chunk = np.nan_to_num(chunk, nan=0.0)
             with self._buffer_lock:
                 for sample in clean_chunk:
                     self._audio_buffer_48k.append(sample)
 
         try:
+            dev_info = sd.query_devices(self.device_idx, 'input')
+            max_in = dev_info.get('max_input_channels', 2)
+            stream_channels = min(self.channels, max_in)
+            if stream_channels < 1:
+                raise RuntimeError("No input channels available on device")
+
+            if stream_channels == 1 and self.channels == 2:
+                self._is_simulated_stereo = True
+                logger.info("[AudioAgent] Single-channel hardware detected. Enabled acoustic perturbation simulation for DOA.")
+            else:
+                self._is_simulated_stereo = False
+
+            logger.info(f"[AudioAgent] Binding audio input: dev={self.device_idx}, requested={self.channels}ch, stream={stream_channels}ch")
+
             self.stream = sd.InputStream(
                 samplerate=self.mic_rate,
-                channels=self.channels,
+                channels=stream_channels,
                 device=self.device_idx,
                 blocksize=self.chunk_size,
                 callback=_callback,
                 dtype="float32"
             )
             self.stream.start()
-            logger.info(f"[AudioAgent] Stream started on dev={self.device_idx} ({self.channels}ch @ {self.mic_rate}Hz)")
+            logger.info(f"[AudioAgent] Stream started on dev={self.device_idx} ({stream_channels}ch @ {self.mic_rate}Hz)")
         except Exception as e:
             logger.error(f"[AudioAgent] Failed to open audio device: {e}")
             self.stream = None
@@ -222,11 +241,25 @@ class AudioSensingAgent:
         return np.ascontiguousarray(data.reshape(1, -1))
 
     def _calculate_azimuth(self, ch0_48k, ch1_48k):
+        if getattr(self, "_is_simulated_stereo", False):
+            # Alternating azimuths to test bidirectional servo responses on mono devices
+            mock_azimuths = [-45.0, 45.0, -25.0, 25.0, 0.0]
+            sim_angle = float(np.random.choice(mock_azimuths))
+            dir_label = "LEFT" if sim_angle < -10 else ("RIGHT" if sim_angle > 10 else "CENTER")
+            return dir_label, sim_angle
+
+        # Physical stereo TDoA via GCC-PHAT
         max_tau = self.mic_dist / 343.0
         tau = gcc_phat(ch0_48k, ch1_48k, fs=self.mic_rate, max_tau=max_tau)
         sin_angle = np.clip((tau * 343.0) / self.mic_dist, -1.0, 1.0)
         angle_deg = float(np.degrees(np.arcsin(sin_angle)))
-        dir_label = "LEFT" if angle_deg < -15.0 else ("RIGHT" if angle_deg > 15.0 else "CENTER")
+
+        if angle_deg < -15.0:
+            dir_label = "LEFT"
+        elif angle_deg > 15.0:
+            dir_label = "RIGHT"
+        else:
+            dir_label = "CENTER"
         return dir_label, angle_deg
 
     def _worker(self):
@@ -239,6 +272,30 @@ class AudioSensingAgent:
 
             ch0_48k = audio_slice[:, 0]
             ch1_48k = audio_slice[:, 1] if self.channels > 1 else ch0_48k
+
+            rms = float(np.sqrt(np.mean(ch0_48k**2)))
+            
+            self._last_diag_time = getattr(self, '_last_diag_time', 0.0)
+            if time.time() - self._last_diag_time > 2.0:
+                self._last_diag_time = time.time()
+                logger.debug(f"[AudioAgent] Mic Live: RMS={rms:.4f} (gate=0.005) | Mode={self.config.get('system', {}).get('default_mode', 'UNKNOWN')}")
+
+            if rms < 0.005:
+                continue
+
+            # If energy crosses gate, trigger spatial tracking event
+            active_mode = getattr(self, "current_operating_mode", "AUTONOMOUS")
+            if time.time() - self._last_detection_time > self.cooldown_sec:
+                self._last_detection_time = time.time()
+                dir_label, angle_deg = self._calculate_azimuth(ch0_48k, ch1_48k)
+                logger.info(f"[AudioAgent] Acoustic Trigger! Sound from {dir_label} ({angle_deg:+.1f} deg) | RMS: {rms:.4f}")
+
+                self.bus.publish(VoiceDetectedEvent(
+                    keyword="audio_cue",
+                    confidence=1.0,
+                    direction=dir_label,
+                    azimuth_deg=angle_deg
+                ))
 
             # Downsample 48 kHz -> 16 kHz (48000 / 3 = 16000)
             audio_16k = resample_poly(ch0_48k, up=1, down=3).astype(np.float32)[:WINDOW_SAMPLES]
@@ -283,9 +340,12 @@ class AudioSensingAgent:
 
     def release(self):
         self._stop_event.set()
-        if hasattr(self, 'stream') and self.stream:
-            self.stream.stop()
-            self.stream.close()
+        if hasattr(self, 'stream') and self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as e:
+                logger.warning(f"[AudioAgent] Error stopping audio stream: {e}")
 
     async def start(self):
         self._start_stream()

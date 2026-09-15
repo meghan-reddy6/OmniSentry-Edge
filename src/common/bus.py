@@ -29,6 +29,10 @@ class SetOperatingModeCommand(Event):
     mode: OperatingMode
 
 @dataclass
+class OperatingModeChangedEvent(Event):
+    mode: str
+
+@dataclass
 class ManualJogCommand(Event):
     pan_delta: float
     tilt_delta: float

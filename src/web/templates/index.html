@@ -218,6 +218,40 @@
                 min-height: 300px;
             }
         }
+    
+        .btn-mode {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: var(--font-sans);
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+        .btn-mode:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        .active-mode {
+            background: var(--accent);
+            color: #000;
+            border-color: var(--accent);
+            font-weight: 600;
+        }
+        #manual-jog-pad button {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: var(--font-sans);
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+        #manual-jog-pad button:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
     </style>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 </head>
@@ -235,6 +269,34 @@
             </div>
             <div class="stream-container">
                 <img id="mjpg-stream" src="/video_feed" alt="OmniSentry Stream" />
+            </div>
+
+            <!-- Control Toolbar -->
+            <div class="mode-toolbar" style="display: flex; gap: 8px; margin: 12px 0; justify-content: center; flex-wrap: wrap; width: 100%;">
+              <button type="button" class="btn-mode" id="btn-auto" onclick="dispatchCommand('mode auto')">Autonomous</button>
+              <button type="button" class="btn-mode" id="btn-terminal" onclick="dispatchCommand('mode terminal')">Terminal / Manual</button>
+              <button type="button" class="btn-mode" id="btn-vision" onclick="dispatchCommand('mode vision_only')">Vision Only</button>
+              <button type="button" class="btn-mode" id="btn-audio" onclick="dispatchCommand('mode audio_only')">Audio Only</button>
+              <button type="button" class="btn-mode" id="btn-standby" onclick="dispatchCommand('mode standby')">Standby</button>
+              <button type="button" class="btn-mode" id="btn-clear" style="background: #334155;" onclick="dispatchCommand('clear')">Clear Terminal</button>
+            </div>
+
+            <!-- Live Audio/Servo Telemetry HUD Under Video -->
+            <div id="telemetry-bar" style="display: flex; justify-content: space-around; background: #1e293b; padding: 10px; border-radius: 6px; margin-bottom: 12px; color: #38bdf8; font-family: monospace; font-size: 14px; width: 100%;">
+              <span>MODE: <strong id="hud-mode" style="color: #4ade80;">UNKNOWN</strong></span>
+              <span>SERVO PAN: <strong id="hud-pan">90°</strong></span>
+              <span>SERVO TILT: <strong id="hud-tilt">75°</strong></span>
+              <span>LAST AUDIO CUE: <strong id="hud-audio" style="color: #f472b6;">NONE</strong></span>
+            </div>
+
+            <div id="manual-jog-pad" style="display: none; text-align: center; margin-bottom: 12px; width: 100%;">
+              <div><button type="button" onclick="dispatchCommand('w')" style="padding: 8px 18px;">▲ Up (W)</button></div>
+              <div style="margin: 4px 0;">
+                <button type="button" onclick="dispatchCommand('a')" style="padding: 8px 18px;">◄ Left (A)</button>
+                <button type="button" onclick="dispatchCommand('home')" style="padding: 8px 14px;">Home</button>
+                <button type="button" onclick="dispatchCommand('d')" style="padding: 8px 18px;">Right (D) ►</button>
+              </div>
+              <div><button type="button" onclick="dispatchCommand('s')" style="padding: 8px 18px;">▼ Down (S)</button></div>
             </div>
         </div>
 
@@ -256,61 +318,138 @@
         const statusDot = document.getElementById('status-dot');
         const statusText = document.getElementById('connection-status');
         
-        let ws;
+        let wsClient = null;
 
-        function appendLog(message, type = 'system') {
-            const el = document.createElement('div');
-            el.className = `log-entry ${type}`;
-            el.textContent = message;
-            cliOutput.appendChild(el);
-            cliOutput.scrollTop = cliOutput.scrollHeight;
-        }
-
-        function connectWebSocket() {
+        function initCLIWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/ws/cli`;
-            
-            ws = new WebSocket(wsUrl);
+            wsClient = new WebSocket(`${protocol}//${window.location.host}/ws/cli`);
 
-            ws.onopen = () => {
+            wsClient.onopen = () => {
                 statusDot.classList.remove('disconnected');
                 statusText.textContent = 'Connected';
-                appendLog('WebSocket Connected to EventBus.', 'system');
+                renderTerminalLine('WebSocket Connected to EventBus.', 'system');
             };
 
-            ws.onmessage = (event) => {
-                appendLog(`System: ${event.data}`, 'system');
+            wsClient.onmessage = function(event) {
+                try {
+                    const payload = JSON.parse(event.data);
+
+                    // Channel 1: Strict Terminal Output
+                    if (payload.channel === "terminal") {
+                        renderTerminalLine(payload.data);
+                        return;
+                    }
+
+                    // Channel 2: Clear Command
+                    if (payload.channel === "control" && payload.action === "clear") {
+                        clearTerminalScreen();
+                        return;
+                    }
+
+                    // Channel 3: Structured Telemetry (DOES NOT TOUCH TERMINAL SCREEN)
+                    if (payload.channel === "telemetry") {
+                        updateHUD(payload);
+                        return;
+                    }
+                } catch(err) {
+                    // Ignore unparseable fragments; NEVER dump them into the terminal
+                }
             };
 
-            ws.onclose = () => {
+            wsClient.onclose = () => {
                 statusDot.classList.add('disconnected');
                 statusText.textContent = 'Disconnected';
-                appendLog('Connection lost. Reconnecting in 3s...', 'error');
-                setTimeout(connectWebSocket, 3000);
+                renderTerminalLine('Connection lost. Reconnecting in 2s...', 'error');
+                setTimeout(initCLIWebSocket, 2000);
             };
 
-            ws.onerror = (error) => {
+            wsClient.onerror = (error) => {
                 console.error('WebSocket Error:', error);
             };
         }
+
+        // Guaranteed command execution
+        function dispatchCommand(cmdStr) {
+            if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+                // Send structured JSON so backend parses unambiguously
+                wsClient.send(JSON.stringify({ "cmd": cmdStr }));
+            } else {
+                console.error("WebSocket is not connected.");
+                // Fallback: Use the terminal input box and simulate an Enter keypress
+                const inputEl = document.querySelector('input[type="text"]') || 
+                                document.getElementById('cli-input');
+                if (inputEl) {
+                    inputEl.value = cmdStr;
+                    const enterEvt = new KeyboardEvent('keydown', {
+                        key: 'Enter',
+                        code: 'Enter',
+                        keyCode: 13,
+                        which: 13,
+                        bubbles: true
+                    });
+                    inputEl.dispatchEvent(enterEvt);
+                }
+            }
+        }
+
+        function renderTerminalLine(text, type = 'system') {
+            const termBox = document.getElementById('cli-output') || 
+                            document.querySelector('.cli-output');
+            if (!termBox) return;
+
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = text;
+            termBox.appendChild(entry);
+            termBox.scrollTop = termBox.scrollHeight;
+        }
+
+        function clearTerminalScreen() {
+            const termBox = document.getElementById('cli-output') || 
+                            document.querySelector('.cli-output');
+            if (termBox) termBox.innerHTML = "";
+        }
+
+        function updateHUD(data) {
+            if (data.mode) {
+                const el = document.getElementById('hud-mode');
+                if (el) el.innerText = data.mode;
+
+                // Update active button state
+                document.querySelectorAll('.btn-mode').forEach(b => b.classList.remove('active-mode'));
+                const btnId = 'btn-' + data.mode.toLowerCase().replace('_only', '').replace(/[\s_]+/g, '');
+                const activeBtn = document.getElementById(btnId);
+                if (activeBtn) activeBtn.classList.add('active-mode');
+
+                const manualJog = document.getElementById('manual-jog-pad');
+                if (manualJog) manualJog.style.display = (data.mode === 'TERMINAL') ? 'block' : 'none';
+            }
+            if (data.pan !== undefined) {
+                const el = document.getElementById('hud-pan');
+                if (el) el.innerText = data.pan + "°";
+            }
+            if (data.tilt !== undefined) {
+                const el = document.getElementById('hud-tilt');
+                if (el) el.innerText = data.tilt + "°";
+            }
+            if (data.audio_cue) {
+                const el = document.getElementById('hud-audio');
+                if (el) el.innerText = data.audio_cue;
+            }
+        }
+
+        document.addEventListener("DOMContentLoaded", initCLIWebSocket);
 
         cliInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
                 const cmd = cliInput.value.trim();
                 if (cmd) {
-                    appendLog(`RubikPi> ${cmd}`, 'user');
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(cmd);
-                    } else {
-                        appendLog('Error: Not connected to server.', 'error');
-                    }
+                    renderTerminalLine(`RubikPi> ${cmd}`, 'user');
+                    dispatchCommand(cmd);
                     cliInput.value = '';
                 }
             }
         });
-
-        // Initialize
-        connectWebSocket();
         
         // Focus input on load
         window.onload = () => {

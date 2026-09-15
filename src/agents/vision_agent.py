@@ -287,7 +287,7 @@ class VisionVLMAgent:
             # HUD Telemetry Bar
             cv2.rectangle(preview, (0, 0), (w, 24), (20, 25, 35), -1)
             status_tag = "SEARCH" if is_searching else ("LOCK" if box is not None else "STANDBY")
-            cv2.putText(preview, f"FEED: 30FPS | STAT: {status_tag} | PAN: {self.last_cmd_pan}° TILT: {self.last_cmd_tilt}°",
+            cv2.putText(preview, f"FEED: 30FPS | STAT: {status_tag} | PAN: {self.last_cmd_pan} deg TILT: {self.last_cmd_tilt} deg",
                         (10, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 180), 1)
 
             ret_enc, jpeg = cv2.imencode(".jpg", preview, encode_params)
@@ -447,7 +447,7 @@ class VisionVLMAgent:
                 self._search_start_time = now
                 self._search_anchor_pan = self.virtual_pan
                 self._search_anchor_tilt = self.virtual_tilt
-                logger.info(f"[VisionAgent] Target lost. Initiating recovery sweep (anchor: {self._search_anchor_pan:.1f}°)")
+                logger.info(f"[VisionAgent] Target lost. Initiating recovery sweep (anchor: {self._search_anchor_pan:.1f} deg)")
 
             elapsed = now - self._search_start_time
             if elapsed > self.search_timeout:

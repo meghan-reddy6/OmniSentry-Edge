@@ -8,12 +8,35 @@ import asyncio
 import logging
 import sys
 import os
+import time
+import re
 
 from src.common.config import SystemConfig
 from src.common.bus import (
     EventBus, MoveServoCommand, TrackCommand,
     OperatingMode, SetOperatingModeCommand, ManualJogCommand, HomeServosCommand
 )
+
+def normalize_mode_string(raw_str: str) -> str:
+    """Normalizes input like 'mode audio only', 'AUDIO_ONLY', 'vision-only' into a canonical key."""
+    s = raw_str.strip().lower()
+    if s.startswith("mode "):
+        s = s[5:].strip()
+    s = re.sub(r"[\s\-]+", "_", s)
+    return s
+
+MODE_LOOKUP = {
+    "auto": OperatingMode.AUTONOMOUS,
+    "autonomous": OperatingMode.AUTONOMOUS,
+    "terminal": OperatingMode.TERMINAL,
+    "manual": OperatingMode.TERMINAL,
+    "vision": OperatingMode.VISION_ONLY,
+    "vision_only": OperatingMode.VISION_ONLY,
+    "audio": OperatingMode.AUDIO_ONLY,
+    "audio_only": OperatingMode.AUDIO_ONLY,
+    "standby": OperatingMode.STANDBY,
+}
+
 from src.agents.orchestrator import OrchestratorAgent
 from src.agents.audio_agent import AudioSensingAgent
 from src.agents.vision_agent import VisionVLMAgent
@@ -38,22 +61,18 @@ async def terminal_cli_worker(bus: EventBus, config: SystemConfig, shutdown_even
     print("  exit            - Stop all agents and terminate the program")
     print("="*60 + "\n")
 
-    mode_map = {
-        "terminal": OperatingMode.TERMINAL,
-        "vision": OperatingMode.VISION_ONLY,
-        "audio": OperatingMode.AUDIO_ONLY,
-        "auto": OperatingMode.AUTONOMOUS,
-        "standby": OperatingMode.STANDBY
-    }
-    
     jog_step = float(config.get("servos", {}).get("tracking", {}).get("jog_step_deg", 4.0))
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             # Run blocking input() inside thread pool to prevent blocking asyncio loop
             user_input = await asyncio.to_thread(input, "OmniSentry> ")
             line = user_input.strip()
             if not line:
+                continue
+
+            if line.lower() in ("clear", "cls"):
+                os.system("cls" if os.name == "nt" else "clear")
                 continue
 
             parts = line.split()
@@ -65,13 +84,20 @@ async def terminal_cli_worker(bus: EventBus, config: SystemConfig, shutdown_even
                 shutdown_event.set()
                 break
                 
-            elif cmd == "mode" and len(parts) > 1:
-                target_mode = parts[1].lower()
-                if target_mode in mode_map:
-                    bus.publish(SetOperatingModeCommand(mode=mode_map[target_mode]))
+            elif cmd == "mode":
+                norm_mode = normalize_mode_string(line)
+                if norm_mode in MODE_LOOKUP:
+                    target = MODE_LOOKUP[norm_mode]
+                    bus.publish(SetOperatingModeCommand(mode=target))
+                    print(f"[*] Switched mode to: {target.value}")
                 else:
-                    print(f"Unknown mode. Choose from: {list(mode_map.keys())}")
+                    print(f"[!] Unknown mode. Options: {list(MODE_LOOKUP.keys())}")
                     
+            elif cmd in MODE_LOOKUP:
+                target = MODE_LOOKUP[cmd]
+                bus.publish(SetOperatingModeCommand(mode=target))
+                print(f"[*] Switched mode to: {target.value}")
+
             elif cmd in ("w", "a", "s", "d"):
                 deltas = {"w": (0, -jog_step), "s": (0, jog_step), "a": (jog_step, 0), "d": (-jog_step, 0)}
                 d_pan, d_tilt = deltas[cmd]
