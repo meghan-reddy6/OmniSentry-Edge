@@ -16,23 +16,16 @@ class ServoActuatorAgent:
         self.bus_num = servo_cfg.get("i2c_bus", 1)
         self.address = servo_cfg.get("i2c_address", 0x40)
 
-        # Pan Configuration (Channel 0: 0°..180°, base: 90°)
-        pan_cfg = servo_cfg.get("pan", {})
-        self.pan_channel = pan_cfg.get("channel", 0)
-        self.pan_min = pan_cfg.get("min_angle", 0)
-        self.pan_max = pan_cfg.get("max_angle", 180)
-        self.pan_base = pan_cfg.get("base_angle", 90)
+        self.pan_cfg = servo_cfg.get("pan", {})
+        self.tilt_cfg = servo_cfg.get("tilt", {})
 
-        # Tilt Configuration (Channel 1: 45°..135°, base: 70°)
-        tilt_cfg = servo_cfg.get("tilt", {})
-        self.tilt_channel = tilt_cfg.get("channel", 1)
-        self.tilt_min = tilt_cfg.get("min_angle", 45)
-        self.tilt_max = tilt_cfg.get("max_angle", 135)
-        self.tilt_base = tilt_cfg.get("base_angle", 70)
+        self.min_angle_change = float(servo_cfg.get("min_angle_change_deg", 1.5))
+        self.min_interval = 1.0 / float(servo_cfg.get("update_rate_hz", 15))
 
         # Initial live angles
-        self.current_pan = float(self.pan_base)
-        self.current_tilt = float(self.tilt_base)
+        self.current_pan = float(self.pan_cfg.get("base_angle", 90))
+        self.current_tilt = float(self.tilt_cfg.get("base_angle", 75))
+        self._last_write_time = 0.0
 
         self.driver = None
         self._init_hardware()
@@ -47,7 +40,7 @@ class ServoActuatorAgent:
 
         try:
             self.driver = PCA9685Direct(bus_num=self.bus_num, address=self.address)
-            self.set_angles(self.pan_base, self.tilt_base)
+            self.set_angles(self.current_pan, self.current_tilt)
             logger.info(f"[ServoAgent]: PCA9685 hardware active on /dev/i2c-{self.bus_num} (Address: 0x{self.address:02X})")
         except Exception as e:
             logger.warning(f"[ServoAgent]: smbus2 hardware init failed: {e}. Falling back to SIMULATION.")
@@ -62,40 +55,53 @@ class ServoActuatorAgent:
         self.home()
 
     def set_angles(self, pan_angle, tilt_angle):
-        # 1. Round to strict integer degrees
-        int_pan = int(round(float(pan_angle)))
-        int_tilt = int(round(float(tilt_angle)))
+        now = time.time()
+        if (now - self._last_write_time) < self.min_interval:
+            return
 
-        # 2. Strict boundary clamping
-        clamped_pan = max(self.pan_min, min(self.pan_max, int_pan))
-        clamped_tilt = max(self.tilt_min, min(self.tilt_max, int_tilt))
+        # 1. Clamp to mechanical physical limits
+        clamped_pan = max(self.pan_cfg.get("min_angle", 10), min(self.pan_cfg.get("max_angle", 170), float(pan_angle)))
+        clamped_tilt = max(self.tilt_cfg.get("min_angle", 40), min(self.tilt_cfg.get("max_angle", 125), float(tilt_angle)))
 
-        # Only execute I2C write if angle has changed by at least 1 full degree
-        if clamped_pan != self.current_pan or clamped_tilt != self.current_tilt:
-            if self.mode == 'simulation':
-                logger.debug(f"[SERVO ] Write -> Pan:{clamped_pan:3d} deg Tilt:{clamped_tilt:3d} deg (was P:{int(self.current_pan):3d} deg T:{int(self.current_tilt):3d} deg)")
-            else:
-                logger.info(f"[ServoAgent] Hardware Write -> Pan: {clamped_pan} deg, Tilt: {clamped_tilt} deg (was {self.current_pan} deg, {self.current_tilt} deg)")
-            self.current_pan = clamped_pan
-            self.current_tilt = clamped_tilt
+        # 2. Anti-shiver threshold: suppress micro-jitter smaller than deadband
+        delta_p = abs(clamped_pan - self.current_pan)
+        delta_t = abs(clamped_tilt - self.current_tilt)
+        if delta_p < self.min_angle_change and delta_t < self.min_angle_change:
+            return
 
-            if self.mode == "hardware" and self.driver:
-                try:
-                    # Explicit bounds clamping via hardware driver
-                    self.driver.set_servo_angle(self.pan_channel, clamped_pan, 
-                                          min_angle=self.pan_min, max_angle=self.pan_max)
-                    self.driver.set_servo_angle(self.tilt_channel, clamped_tilt, 
-                                          min_angle=self.tilt_min, max_angle=self.tilt_max)
-                except Exception as e:
-                    logger.error(f"[ServoAgent]: I2C write error: {e}")
+        self.current_pan = clamped_pan
+        self.current_tilt = clamped_tilt
+        self._last_write_time = now
 
-            # Publish integer state update to EventBus
-            self.bus.publish(ServoTargetReachedEvent(pan=self.current_pan, tilt=self.current_tilt))
+        # 3. Apply centralized hardware axis inversion right before physical bus write
+        hw_pan = (180.0 - clamped_pan) if self.pan_cfg.get("invert", False) else clamped_pan
+        hw_tilt = (180.0 - clamped_tilt) if self.tilt_cfg.get("invert", False) else clamped_tilt
+
+        self._write_pca9685(int(round(hw_pan)), int(round(hw_tilt)))
+
+    def _write_pca9685(self, pan: int, tilt: int):
+        if self.mode == 'simulation':
+            logger.debug(f"[SERVO ] Write -> Pan:{pan:3d} deg Tilt:{tilt:3d} deg (was P:{int(self.current_pan):3d} deg T:{int(self.current_tilt):3d} deg)")
+        else:
+            logger.info(f"[ServoAgent] Hardware Write -> Pan: {pan} deg, Tilt: {tilt} deg (was {self.current_pan} deg, {self.current_tilt} deg)")
+
+        if self.mode == "hardware" and self.driver:
+            try:
+                # Explicit bounds clamping via hardware driver using raw config bounds since we already clamped
+                self.driver.set_servo_angle(self.pan_cfg.get("channel", 0), pan, 
+                                      min_angle=self.pan_cfg.get("min_angle", 0), max_angle=self.pan_cfg.get("max_angle", 180))
+                self.driver.set_servo_angle(self.tilt_cfg.get("channel", 1), tilt, 
+                                      min_angle=self.tilt_cfg.get("min_angle", 0), max_angle=self.tilt_cfg.get("max_angle", 180))
+            except Exception as e:
+                logger.error(f"[ServoAgent]: I2C write error: {e}")
+
+        # Publish state update to EventBus
+        self.bus.publish(ServoTargetReachedEvent(pan=self.current_pan, tilt=self.current_tilt))
 
     def home(self):
         """Restores pan and tilt servos to default base positions."""
-        self.set_angles(self.pan_base, self.tilt_base)
-        logger.info(f"[ServoAgent]: Servos homed to Base (Pan: {self.pan_base} deg, Tilt: {self.tilt_base} deg)")
+        self.set_angles(self.pan_cfg.get("base_angle", 90), self.tilt_cfg.get("base_angle", 75))
+        logger.info(f"[ServoAgent]: Servos homed to Base")
 
     async def start(self):
         self.home()

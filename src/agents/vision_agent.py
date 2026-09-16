@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 import numpy as np
 import onnxruntime as ort
-from src.common.bus import MoveServoCommand
+from src.common.bus import MoveServoCommand, VisualTargetOffsetEvent
 from src.hardware.camera import CameraStream
 
 logger = logging.getLogger("VisionAgent")
@@ -472,12 +472,8 @@ class VisionVLMAgent:
 
     def _compute_and_dispatch_step(self, w, h):
         now = time.time()
-        if (now - self._last_servo_time) < 0.040:
+        if (now - self._last_servo_time) < 0.050:
             return
-
-        dt = (now - self._last_servo_time) if self._last_servo_time > 0 else 0.045
-        if dt <= 0.0 or dt > 0.2:
-            dt = 0.045
 
         with self._tracking_lock:
             if self.locked_box is None:
@@ -488,40 +484,26 @@ class VisionVLMAgent:
         err_x = ((sx + sw / 2.0) - cx) / cx
         err_y = ((sy + sh / 2.0) - cy) / cy
 
+        # Notify orchestrator of active tracking
+        self.bus.publish(VisualTargetOffsetEvent(offset_x=err_x, offset_y=err_y))
+
         delta_pan = 0.0
         if abs(err_x) > self.deadband_x:
-            d_x = 0.0 if self._prev_error_x is None else (err_x - self._prev_error_x) / dt
-            pd_x = (self.kp_pan * err_x) + (self.kd_pan * d_x)
-            mag_x = min(self.max_step, max(self.min_breakaway, abs(pd_x)))
-            sign_x = -1.0 if err_x > 0 else 1.0
-            if self.invert_pan:
-                sign_x = -sign_x
-            delta_pan = sign_x * mag_x
-        self._prev_error_x = err_x
+            delta_pan = -self.kp_pan * err_x * self.max_step
 
         delta_tilt = 0.0
         if abs(err_y) > self.deadband_y:
-            d_y = 0.0 if self._prev_error_y is None else (err_y - self._prev_error_y) / dt
-            pd_y = (self.kp_tilt * err_y) + (self.kd_tilt * d_y)
-            mag_y = min(self.max_step, max(self.min_breakaway, abs(pd_y)))
-            sign_y = -1.0 if err_y > 0 else 1.0
-            if self.invert_tilt:
-                sign_y = -sign_y
-            delta_tilt = sign_y * mag_y
-        self._prev_error_y = err_y
+            # Positive err_y (target below center) commands downward tilt
+            delta_tilt = self.kp_tilt * err_y * self.max_step
 
-        if delta_pan != 0.0 or delta_tilt != 0.0:
-            self.virtual_pan = max(self.pan_min, min(self.pan_max, self.virtual_pan + delta_pan))
-            self.virtual_tilt = max(self.tilt_min, min(self.tilt_max, self.virtual_tilt + delta_tilt))
-
-            cmd_p = int(round(self.virtual_pan))
-            cmd_t = int(round(self.virtual_tilt))
-
-            if cmd_p != self.last_cmd_pan or cmd_t != self.last_cmd_tilt:
-                self.last_cmd_pan = cmd_p
-                self.last_cmd_tilt = cmd_t
-                self._last_servo_time = now
-                self.bus.publish(MoveServoCommand(pan=cmd_p, tilt=cmd_t))
+        if abs(delta_pan) > 0.1 or abs(delta_tilt) > 0.1:
+            self.virtual_pan += delta_pan
+            self.virtual_tilt += delta_tilt
+            self._last_servo_time = now
+            self.bus.publish(MoveServoCommand(
+                pan=int(round(self.virtual_pan)), 
+                tilt=int(round(self.virtual_tilt))
+            ))
 
     def get_latest_jpeg(self):
         with self._frame_lock:
@@ -534,3 +516,8 @@ class VisionVLMAgent:
     async def stop(self):
         self._stop_event.set()
         self.camera.release()
+        # Clean ONNX session handle to prevent FastRPC graph errors on Hexagon NPU
+        if hasattr(self, "session") and self.session is not None:
+            logger.info("[VisionAgent] Releasing ONNX inference session...")
+            del self.session
+            self.session = None

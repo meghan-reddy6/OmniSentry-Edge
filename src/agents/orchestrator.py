@@ -5,12 +5,14 @@ Functions as the primary State Machine Engine for the OmniSentry-Edge stack.
 Arbitrates control authority between acoustic sound-seeking mode and high-level 
 VLM target tracking via the async event bus.
 """
+import time
 import logging
 import numpy as np
 from enum import Enum, auto
 from src.common.bus import (
     Event, VoiceDetectedEvent, TrackCommand, OperatingMode,
-    SetOperatingModeCommand, ManualJogCommand, HomeServosCommand
+    SetOperatingModeCommand, ManualJogCommand, HomeServosCommand,
+    VisualTargetOffsetEvent
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,10 @@ class OrchestratorAgent:
         self.current_pan = 90.0
         self.current_tilt = 75.0
         
+        self._last_state_change = time.time()
+        self._min_state_dwell = 0.500  # 500ms debounce
+        self._last_visual_detection_time = 0.0
+        
         default_mode = self.config.get("system", {}).get("default_mode", "AUTONOMOUS").upper()
         self.current_mode = OperatingMode(default_mode)
 
@@ -59,8 +65,24 @@ class OrchestratorAgent:
         self.bus.subscribe("ServoTargetReachedEvent", self.handle_servo_reached)
         self.bus.subscribe("TrackCommand", self.handle_track_command)
         self.bus.subscribe("VoiceDetectedEvent", self._handle_voice_detected)
+        self.bus.subscribe("VisualTargetOffsetEvent", self._handle_visual_offset)
         self.bus.subscribe("SetOperatingModeCommand", self._handle_set_mode)
         self.bus.subscribe("ManualJogCommand", self._handle_manual_jog)
+
+    def transition_to(self, new_state: SystemState):
+        now = time.time()
+        if new_state != self.state and (now - self._last_state_change) >= self._min_state_dwell:
+            logger.info(f"[Orchestrator] State transition: {self.state} -> {new_state}")
+            self.state = new_state
+            self._last_state_change = now
+            self.bus.publish(StateChangeEvent(new_state=new_state))
+
+    def _handle_visual_offset(self, event: VisualTargetOffsetEvent):
+        if self.current_mode not in (OperatingMode.AUTONOMOUS, OperatingMode.VISION_ONLY):
+            return
+        
+        self._last_visual_detection_time = time.time()
+        self.transition_to(SystemState.VLM_TRACKING)
 
     def handle_track_command(self, event):
         if self.current_mode not in (OperatingMode.VISION_ONLY, OperatingMode.AUTONOMOUS):
@@ -98,22 +120,24 @@ class OrchestratorAgent:
                 self.bus.publish(StateChangeEvent(new_state=SystemState.IDLE))
 
     def _handle_voice_detected(self, event: VoiceDetectedEvent):
-        if self.current_mode not in (OperatingMode.AUDIO_ONLY, OperatingMode.AUTONOMOUS):
+        now = time.time()
+        
+        # In Autonomous mode: suppress audio cues if actively tracking visual target
+        if self.current_mode == OperatingMode.AUTONOMOUS:
+            if self.state == SystemState.VLM_TRACKING and (now - self._last_visual_detection_time < 1.0):
+                logger.debug("[Orchestrator] Audio cue suppressed: active visual lock.")
+                return
+
+        if self.current_mode not in (OperatingMode.AUTONOMOUS, OperatingMode.AUDIO_ONLY):
             return
 
-        # Slew pan servo toward sound azimuth (proportional step)
-        pan_offset = -event.azimuth_deg * 0.75
+        self.transition_to(SystemState.ACOUSTIC_SEEK)
+        pan_offset = -event.azimuth_deg * 0.70
         new_pan = max(self.pan_min, min(self.pan_max, self.current_pan + pan_offset))
-        new_tilt = self.current_tilt
 
-        logger.info(
-            f"[Orchestrator] Audio Orientation Command: "
-            f"Direction={event.direction} | Offset={pan_offset:+.1f} deg -> "
-            f"New Coordinates: (Pan={new_pan:.1f} deg, Tilt={new_tilt:.1f} deg)"
-        )
-
+        logger.info(f"[Orchestrator] Acoustic seek: {event.direction} -> Pan={new_pan:.1f}°")
         self.current_pan = new_pan
-        self.bus.publish(MoveServoCommand(pan=int(round(new_pan)), tilt=int(round(new_tilt))))
+        self.bus.publish(MoveServoCommand(pan=int(round(new_pan)), tilt=int(round(self.current_tilt))))
 
     def _handle_set_mode(self, cmd: SetOperatingModeCommand):
         self.current_mode = cmd.mode

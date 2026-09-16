@@ -147,11 +147,12 @@ class AudioSensingAgent:
         hw_cfg = audio_cfg.get("hardware", {})
         kws_cfg = audio_cfg.get("kws", {})
 
-        self.mic_rate = hw_cfg.get("sample_rate", 48000)
-        self.channels = hw_cfg.get("channels", 2)
-        self.chunk_size = hw_cfg.get("chunk_size", 1024)
-        self.device_idx = hw_cfg.get("device_index", 2)
-        self.mic_dist = hw_cfg.get("mic_distance_meters", 0.065)
+        self.sample_rate = audio_cfg.get("sample_rate", 16000)
+        self.channels = audio_cfg.get("channels", 2)
+        self.chunk_size = audio_cfg.get("chunk_size", 1024)
+        self.device_idx = audio_cfg.get("device_index", 2)
+        self.mic_dist = audio_cfg.get("mic_distance_m", 0.08)
+        self.vad_gate = audio_cfg.get("vad_gate_rms", 0.045)
 
         self.conf_threshold = kws_cfg.get("confidence_threshold", 0.70)
         self.input_scale = kws_cfg.get("input_scale", None)
@@ -159,8 +160,8 @@ class AudioSensingAgent:
         self.consecutive_hits = kws_cfg.get("consecutive_hits", 3)
         self.cooldown_sec = kws_cfg.get("cooldown_sec", 1.5)
 
-        self._audio_buffer_48k = deque(maxlen=self.mic_rate)  # 1-second rolling 48k window
-        self._buffer_lock = threading.Lock()
+        import queue
+        self._raw_queue = queue.SimpleQueue()
         self._stop_event = threading.Event()
         self._recent_hits = deque(maxlen=self.consecutive_hits)
         self._last_detection_time = 0.0
@@ -180,23 +181,22 @@ class AudioSensingAgent:
         self.input_info = self.session.get_inputs()[0]
         self.output_info = self.session.get_outputs()[0]
 
-    def _start_stream(self):
+        if hasattr(self.bus, 'subscribe'):
+            self.bus.subscribe("MoveServoCommand", self._handle_servo_move)
+
+    def _handle_servo_move(self, event):
+        self._last_servo_move_time = time.time()
+
+    def _start_hardware_stream(self, device_idx):
         def _callback(indata, frames, time_info, status):
             if status:
                 logger.warning(f"[AudioAgent] Stream status: {status}")
-            # If native capture is mono, broadcast across stereo buffer
-            if indata.shape[1] == 1 and self.channels == 2:
-                chunk = np.repeat(indata, 2, axis=1)
-            else:
-                chunk = indata
-                
-            clean_chunk = np.nan_to_num(chunk, nan=0.0)
-            with self._buffer_lock:
-                for sample in clean_chunk:
-                    self._audio_buffer_48k.append(sample)
+            # Non-blocking callback: pushes raw pointer to thread-safe queue
+            clean_chunk = np.nan_to_num(indata, nan=0.0, posinf=0.0, neginf=0.0)
+            self._raw_queue.put(clean_chunk.copy())
 
         try:
-            dev_info = sd.query_devices(self.device_idx, 'input')
+            dev_info = sd.query_devices(device_idx, 'input')
             max_in = dev_info.get('max_input_channels', 2)
             stream_channels = min(self.channels, max_in)
             if stream_channels < 1:
@@ -208,20 +208,19 @@ class AudioSensingAgent:
             else:
                 self._is_simulated_stereo = False
 
-            logger.info(f"[AudioAgent] Binding audio input: dev={self.device_idx}, requested={self.channels}ch, stream={stream_channels}ch")
-
             self.stream = sd.InputStream(
-                samplerate=self.mic_rate,
+                samplerate=self.sample_rate,
                 channels=stream_channels,
-                device=self.device_idx,
+                device=device_idx,
                 blocksize=self.chunk_size,
+                latency='low',
                 callback=_callback,
                 dtype="float32"
             )
             self.stream.start()
-            logger.info(f"[AudioAgent] Stream started on dev={self.device_idx} ({stream_channels}ch @ {self.mic_rate}Hz)")
+            logger.info(f"[AudioAgent] INMP441 stream active @ {self.sample_rate}Hz ({self.channels}ch)")
         except Exception as e:
-            logger.error(f"[AudioAgent] Failed to open audio device: {e}")
+            logger.error(f"[AudioAgent] Hardware audio stream failed: {e}")
             self.stream = None
 
     def _prepare_tensor(self, features):
@@ -250,7 +249,7 @@ class AudioSensingAgent:
 
         # Physical stereo TDoA via GCC-PHAT
         max_tau = self.mic_dist / 343.0
-        tau = gcc_phat(ch0_48k, ch1_48k, fs=self.mic_rate, max_tau=max_tau)
+        tau = gcc_phat(ch0_48k, ch1_48k, fs=self.sample_rate, max_tau=max_tau)
         sin_angle = np.clip((tau * 343.0) / self.mic_dist, -1.0, 1.0)
         angle_deg = float(np.degrees(np.arcsin(sin_angle)))
 
@@ -262,32 +261,48 @@ class AudioSensingAgent:
             dir_label = "CENTER"
         return dir_label, angle_deg
 
-    def _worker(self):
+    def _processing_worker(self):
+        import queue
+        audio_buffer = []
+        
         while not self._stop_event.is_set():
-            time.sleep(0.040)
-            with self._buffer_lock:
-                if len(self._audio_buffer_48k) < self.mic_rate:
-                    continue
-                audio_slice = np.array(self._audio_buffer_48k, dtype=np.float32)
+            try:
+                chunk = self._raw_queue.get(timeout=0.1)
+                audio_buffer.extend(chunk)
+                # Keep 1 second of audio
+                if len(audio_buffer) > self.sample_rate:
+                    audio_buffer = audio_buffer[-self.sample_rate:]
+            except queue.Empty:
+                continue
 
-            ch0_48k = audio_slice[:, 0]
-            ch1_48k = audio_slice[:, 1] if self.channels > 1 else ch0_48k
+            if len(audio_buffer) < self.sample_rate:
+                continue
 
-            rms = float(np.sqrt(np.mean(ch0_48k**2)))
+            audio_slice = np.array(audio_buffer, dtype=np.float32)
+
+            ch0 = audio_slice[:, 0]
+            ch1 = audio_slice[:, 1] if self.channels > 1 else ch0
+
+            rms = float(np.sqrt(np.mean(ch0**2)))
             
             self._last_diag_time = getattr(self, '_last_diag_time', 0.0)
             if time.time() - self._last_diag_time > 2.0:
                 self._last_diag_time = time.time()
-                logger.debug(f"[AudioAgent] Mic Live: RMS={rms:.4f} (gate=0.005) | Mode={self.config.get('system', {}).get('default_mode', 'UNKNOWN')}")
+                logger.debug(f"[AudioAgent] Mic Live: RMS={rms:.4f} (gate={self.vad_gate:.3f}) | Mode={self.config.get('system', {}).get('default_mode', 'UNKNOWN')}")
 
-            if rms < 0.005:
+            # Check if servos are actively slewing
+            now = time.time()
+            if hasattr(self, "_last_servo_move_time") and (now - self._last_servo_move_time < 0.6):
+                continue  # Ignore audio while servos are stepping
+
+            if rms < self.vad_gate:
                 continue
 
             # If energy crosses gate, trigger spatial tracking event
             active_mode = getattr(self, "current_operating_mode", "AUTONOMOUS")
             if time.time() - self._last_detection_time > self.cooldown_sec:
                 self._last_detection_time = time.time()
-                dir_label, angle_deg = self._calculate_azimuth(ch0_48k, ch1_48k)
+                dir_label, angle_deg = self._calculate_azimuth(ch0, ch1)
                 logger.info(f"[AudioAgent] Acoustic Trigger! Sound from {dir_label} ({angle_deg:+.1f} deg) | RMS: {rms:.4f}")
 
                 self.bus.publish(VoiceDetectedEvent(
@@ -297,8 +312,8 @@ class AudioSensingAgent:
                     azimuth_deg=angle_deg
                 ))
 
-            # Downsample 48 kHz -> 16 kHz (48000 / 3 = 16000)
-            audio_16k = resample_poly(ch0_48k, up=1, down=3).astype(np.float32)[:WINDOW_SAMPLES]
+            # Since stream is already 16 kHz, no downsampling is needed
+            audio_16k = ch0[:WINDOW_SAMPLES]
 
             try:
                 features = extract_edge_impulse_features(audio_16k)
@@ -324,7 +339,7 @@ class AudioSensingAgent:
                 if enough_hits and past_cooldown:
                     self._last_detection_time = now
                     self._recent_hits.clear()
-                    dir_label, angle_deg = self._calculate_azimuth(ch0_48k, ch1_48k)
+                    dir_label, angle_deg = self._calculate_azimuth(ch0, ch1)
 
                     logger.info(f"[AudioAgent] WAKE WORD DETECTED! Prob={wake_prob:.3f} | Dir={dir_label} ({angle_deg:+.1f}°)")
                     self.bus.publish(VoiceDetectedEvent(
@@ -348,8 +363,8 @@ class AudioSensingAgent:
                 logger.warning(f"[AudioAgent] Error stopping audio stream: {e}")
 
     async def start(self):
-        self._start_stream()
-        self._worker_thread = threading.Thread(target=self._worker, daemon=True, name="AudioKWSWorker")
+        self._start_hardware_stream(self.device_idx)
+        self._worker_thread = threading.Thread(target=self._processing_worker, daemon=True, name="AudioDSPWorker")
         self._worker_thread.start()
         logger.info("[AudioAgent] Started.")
 
@@ -357,4 +372,10 @@ class AudioSensingAgent:
         self.release()
         if hasattr(self, '_worker_thread') and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=1.0)
+            
+        if hasattr(self, "session") and self.session is not None:
+            logger.info("[AudioAgent] Deallocating ONNX inference session...")
+            del self.session
+            self.session = None
+            
         logger.info("[AudioAgent] Stopped.")

@@ -31,12 +31,12 @@ vision:
     inference_fps_limit: 20
 
 audio:
-  hardware:
-    device_index: 2            # RubikPi 3 capture hardware index
-    sample_rate: 48000         # Physical mic capture rate (resampled to 16000)
-    channels: 2                # 2-channel input (Ch0 for KWS, Ch0+Ch1 for TDoA)
-    chunk_size: 1024
-    mic_distance_meters: 0.065 # Physical baseline for GCC-PHAT TDoA
+  device_index: 2             # RubikPi 3 capture hardware index
+  sample_rate: 16000          # Native INMP441 I2S sampling frequency
+  channels: 2                 # Stereo I2S array
+  chunk_size: 1024            # 64ms block window
+  mic_distance_m: 0.08        # Physical inter-capsule spacing
+  vad_gate_rms: 0.045         # Noise floor threshold above motor idle
 
   kws:
     model_path: "models/kws_model.onnx"
@@ -52,30 +52,31 @@ servos:
   i2c_bus: 1
   i2c_address: 0x40
   pwm_frequency: 50
+  update_rate_hz: 15          # Max physical update frequency (66ms interval)
+  min_angle_change_deg: 1.5   # Physical deadband: suppresses micro-jitter below 1.5 deg
 
   pan:
     channel: 0
-    min_angle: 5
-    max_angle: 175
     base_angle: 90
+    min_angle: 10
+    max_angle: 170
     invert: false
 
   tilt:
     channel: 1
-    min_angle: 45
-    max_angle: 125
     base_angle: 75
-    invert: false
+    min_angle: 40
+    max_angle: 125
+    invert: true              # Centralized mechanical inversion for tilt axis
 
   tracking:
-    kp_pan: 4.2
-    kd_pan: 0.38
-    kp_tilt: 3.2
-    kd_tilt: 0.28
-    deadband_x: 0.06
-    deadband_y: 0.06
-    max_step_deg: 5.0
-    min_breakaway_deg: 1.8
+    kp_pan: 2.0
+    kd_pan: 0.50
+    kp_tilt: 1.6
+    kd_tilt: 0.40
+    deadband_x: 0.12          # 12% frame center deadband to stop visual hunt
+    deadband_y: 0.12
+    max_step_deg: 2.5
     update_interval_sec: 0.045
     jog_step_deg: 4.0
     loss_recovery:

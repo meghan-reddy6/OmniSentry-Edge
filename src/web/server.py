@@ -102,20 +102,18 @@ class SafeConnectionManager:
             self.active_connections.discard(websocket)
 
     async def send_terminal_text(self, text: str):
-        import json
-        payload = json.dumps({"channel": "terminal", "data": text})
-        await self._broadcast_raw(payload)
+        payload = {"channel": "terminal", "data": text}
+        await self.broadcast_safe(payload)
 
     async def send_telemetry(self, mode: str, pan: float, tilt: float, audio_cue: str = None):
-        import json
-        payload = json.dumps({
+        payload = {
             "channel": "telemetry",
             "mode": mode,
             "pan": round(pan, 1),
             "tilt": round(tilt, 1),
             "audio_cue": audio_cue or "NONE"
-        })
-        await self._broadcast_raw(payload)
+        }
+        await self.broadcast_safe(payload)
 
     def threadsafe_send_telemetry(self, mode: str, pan: float, tilt: float, audio_cue: str = None):
         if self.loop and self.loop.is_running():
@@ -124,15 +122,18 @@ class SafeConnectionManager:
                 self.loop
             )
 
-    async def _broadcast_raw(self, message: str):
+    async def broadcast_safe(self, payload_dict: dict):
+        """Broadcasts thread-safely by serializing through an asyncio.Lock."""
+        import json
+        message = json.dumps(payload_dict)
         async with self.lock:
-            dead_sockets = []
+            stale = []
             for ws in list(self.active_connections):
                 try:
                     await ws.send_text(message)
                 except Exception:
-                    dead_sockets.append(ws)
-            for ws in dead_sockets:
+                    stale.append(ws)
+            for ws in stale:
                 self.active_connections.discard(ws)
 
 manager = SafeConnectionManager()

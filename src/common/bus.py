@@ -60,6 +60,11 @@ class SoundLocalizedEvent(Event):
         self.angle = angle
         self.volume = volume
 
+@dataclass
+class VisualTargetOffsetEvent(Event):
+    offset_x: float
+    offset_y: float
+
 class AudioTelemetryEvent(Event):
     def __init__(self, current_db: float, noise_floor: float):
         self.current_db = current_db
