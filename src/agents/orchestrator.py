@@ -68,6 +68,7 @@ class OrchestratorAgent:
         self.bus.subscribe("VisualTargetOffsetEvent", self._handle_visual_offset)
         self.bus.subscribe("SetOperatingModeCommand", self._handle_set_mode)
         self.bus.subscribe("ManualJogCommand", self._handle_manual_jog)
+        self.bus.subscribe("HomeServosCommand", self._handle_home_command)
 
     def transition_to(self, new_state: SystemState):
         now = time.time()
@@ -138,6 +139,13 @@ class OrchestratorAgent:
         logger.info(f"[Orchestrator] Acoustic seek: {event.direction} -> Pan={new_pan:.1f}°")
         self.current_pan = new_pan
         self.bus.publish(MoveServoCommand(pan=int(round(new_pan)), tilt=int(round(self.current_tilt))))
+
+    def _handle_home_command(self, cmd: HomeServosCommand):
+        self.state = SystemState.IDLE
+        self.current_pan = 90.0
+        self.current_tilt = 75.0
+        self.bus.publish(TrackCommand(prompt=""))
+        logger.info("[Orchestrator] System returned to STANDBY; tracking cancelled.")
 
     def _handle_set_mode(self, cmd: SetOperatingModeCommand):
         self.current_mode = cmd.mode

@@ -147,6 +147,9 @@ class VisionVLMAgent:
         self.is_tracking_active = False
         self.current_prompt = None
 
+        self._tracking_start_time = 0.0
+        self._has_acquired_at_least_once = False
+
         servos = self.config.get("servos", {})
         tracking = servos.get("tracking", {})
         self.pan_min = float(servos.get("pan", {}).get("min_angle", 10))
@@ -211,6 +214,7 @@ class VisionVLMAgent:
 
         if hasattr(self.bus, 'subscribe'):
             self.bus.subscribe("TrackCommand", self.handle_track_command)
+            self.bus.subscribe("HomeServosCommand", lambda evt: self.handle_stop_or_home())
 
         threading.Thread(target=self._capture_worker, daemon=True, name="VisionCapture").start()
         threading.Thread(target=self._inference_worker, daemon=True, name="VisionInference").start()
@@ -227,20 +231,38 @@ class VisionVLMAgent:
         with self._tracking_lock:
             self.current_prompt = cleaned
             self.is_tracking_active = True
+            self.locked_box = None
+            self.smooth_box = None
+            self._prev_error_x = None
+            self._prev_error_y = None
+            
+            # CRITICAL: Reset loss and search counters so it doesn't immediately enter search sweep
             self._consecutive_lost = 0
             self._is_searching = False
-            self.locked_box = None
-            self.smooth_box = None
-        logger.info(f"[VisionAgent]: Active tracking ENGAGED for target: '{cleaned}'")
+            self._search_start_time = 0.0
+            
+            # Anchor search to current physical position
+            self._search_anchor_pan = self.virtual_pan
+            self._search_anchor_tilt = self.virtual_tilt
+            
+            self._tracking_start_time = time.time()
+            self._has_acquired_at_least_once = False
+        logger.info(f"[VisionAgent] Tracking ENGAGED for '{self.current_prompt}'. Search counters zeroed.")
 
     def stop_tracking(self):
+        self.handle_stop_or_home()
+
+    def handle_stop_or_home(self):
         with self._tracking_lock:
-            self.current_prompt = None
             self.is_tracking_active = False
-            self._is_searching = False
+            self.current_prompt = None
             self.locked_box = None
             self.smooth_box = None
-        logger.info("[VisionAgent]: Tracking STOPPED. Gimbal locked in Standby.")
+            self._is_searching = False
+            self._consecutive_lost = 0
+            self._prev_error_x = None
+            self._prev_error_y = None
+        logger.info("[VisionAgent] Tracking actively DISARMED by Home/Stop command.")
 
     def _capture_worker(self):
         """Runs at full sensor FPS (~30Hz), keeping preview responsive and low-latency."""
@@ -397,6 +419,7 @@ class VisionVLMAgent:
 
             # Handle detection state transitions
             if matched is not None:
+                self._has_acquired_at_least_once = True
                 # Target found: abort search mode if active
                 with self._tracking_lock:
                     if self._is_searching:
@@ -434,8 +457,9 @@ class VisionVLMAgent:
                     self._prev_error_y = None
                     self._consecutive_lost += 1
 
-                if self.recovery_enabled and self._consecutive_lost >= self.lost_threshold:
-                    self._execute_search_sweep(now)
+                if self.recovery_enabled and self._has_acquired_at_least_once:
+                    if self._consecutive_lost >= self.lost_threshold:
+                        self._execute_search_sweep(now)
 
             time.sleep(0.010)
 
@@ -480,6 +504,7 @@ class VisionVLMAgent:
                 return
             sx, sy, sw, sh = self.locked_box
 
+        # Target center offset
         cx, cy = w / 2.0, h / 2.0
         err_x = ((sx + sw / 2.0) - cx) / cx
         err_y = ((sy + sh / 2.0) - cy) / cy
@@ -487,23 +512,29 @@ class VisionVLMAgent:
         # Notify orchestrator of active tracking
         self.bus.publish(VisualTargetOffsetEvent(offset_x=err_x, offset_y=err_y))
 
+        # Pan: Target to the right (err_x > 0) requires camera to pan right
         delta_pan = 0.0
         if abs(err_x) > self.deadband_x:
             delta_pan = -self.kp_pan * err_x * self.max_step
 
+        # Tilt: Target below center (err_y > 0) requires camera to tilt down
         delta_tilt = 0.0
         if abs(err_y) > self.deadband_y:
-            # Positive err_y (target below center) commands downward tilt
             delta_tilt = self.kp_tilt * err_y * self.max_step
 
         if abs(delta_pan) > 0.1 or abs(delta_tilt) > 0.1:
-            self.virtual_pan += delta_pan
-            self.virtual_tilt += delta_tilt
-            self._last_servo_time = now
-            self.bus.publish(MoveServoCommand(
-                pan=int(round(self.virtual_pan)), 
-                tilt=int(round(self.virtual_tilt))
-            ))
+            # Update virtual setpoints
+            self.virtual_pan = max(self.pan_min, min(self.pan_max, self.virtual_pan + delta_pan))
+            self.virtual_tilt = max(self.tilt_min, min(self.tilt_max, self.virtual_tilt + delta_tilt))
+
+            cmd_p = int(round(self.virtual_pan))
+            cmd_t = int(round(self.virtual_tilt))
+
+            if cmd_p != self.last_cmd_pan or cmd_t != self.last_cmd_tilt:
+                self.last_cmd_pan = cmd_p
+                self.last_cmd_tilt = cmd_t
+                self._last_servo_time = now
+                self.bus.publish(MoveServoCommand(pan=cmd_p, tilt=cmd_t))
 
     def get_latest_jpeg(self):
         with self._frame_lock:

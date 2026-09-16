@@ -241,10 +241,11 @@ async def websocket_cli_endpoint(websocket: WebSocket):
                 _bus.publish(TrackCommand(prompt=prompt))
                 await manager.send_terminal_text(f"Tracking initiated for: {prompt}")
                 
-            elif cmd == "home":
+            elif cmd in ("home", "h"):
                 logger.info(f"WebCLI: HOME")
+                _bus.publish(TrackCommand(prompt=""))
                 _bus.publish(HomeServosCommand())
-                await manager.send_terminal_text("Returned to home position.")
+                await manager.send_terminal_text("System: Servos homed and tracking stopped.")
                 
             elif cmd == "goto" or cmd == "move":
                 if len(parts) == 2:
