@@ -232,14 +232,18 @@ async def websocket_cli_endpoint(websocket: WebSocket):
             elif cmd == "status":
                 await manager.send_terminal_text("Status printed to orchestrator logs.")
                 
-            elif cmd == "track":
-                if len(parts) < 2:
+            elif cmd_clean.lower().startswith("track "):
+                prompt = cmd_clean[6:].strip()
+                if prompt:
+                    # 1. Force state transition out of TERMINAL / STANDBY
+                    _bus.publish(SetOperatingModeCommand(mode=OperatingMode.AUTONOMOUS))
+                    # 2. Engage vision agent tracking
+                    _bus.publish(TrackCommand(prompt=prompt))
+                    await manager.send_terminal_text(f"System: Switched to AUTONOMOUS and tracking: '{prompt}'")
+                    continue
+                else:
                     await manager.send_terminal_text("Error: Missing tracking target prompt (e.g. 'track red bottle')")
                     continue
-                prompt = parts[1].strip()
-                logger.info(f"WebCLI: Launching TrackCommand for '{prompt}'")
-                _bus.publish(TrackCommand(prompt=prompt))
-                await manager.send_terminal_text(f"Tracking initiated for: {prompt}")
                 
             elif cmd in ("home", "h"):
                 logger.info(f"WebCLI: HOME")

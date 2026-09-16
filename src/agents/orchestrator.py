@@ -86,15 +86,13 @@ class OrchestratorAgent:
         self.transition_to(SystemState.VLM_TRACKING)
 
     def handle_track_command(self, event):
-        if self.current_mode not in (OperatingMode.VISION_ONLY, OperatingMode.AUTONOMOUS):
-            prompt = getattr(event, 'prompt', None)
-            if prompt:
-                logger.warning("[Orchestrator] Vision tracking ignored: Active mode does not permit vision lock.")
-            return
-
         prompt = getattr(event, 'prompt', None) or getattr(event, 'target', None)
         if isinstance(prompt, str) and prompt.strip():
             self.current_prompt = prompt.strip()
+            if self.current_mode not in (OperatingMode.AUTONOMOUS, OperatingMode.VISION_ONLY):
+                logger.info(f"[Orchestrator] Promoting mode from {self.current_mode.value} to AUTONOMOUS for tracking.")
+                self.current_mode = OperatingMode.AUTONOMOUS
+            
             self.state = SystemState.VLM_TRACKING
             logger.info(f"[Orchestrator]: State -> VLM_TRACKING for target '{self.current_prompt}'")
             self.bus.publish(StateChangeEvent(new_state=SystemState.VLM_TRACKING))

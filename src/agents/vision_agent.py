@@ -180,7 +180,7 @@ class VisionVLMAgent:
         # Target-loss recovery parameters
         rec_cfg = tracking.get("loss_recovery", {})
         self.recovery_enabled = rec_cfg.get("enabled", True)
-        self.lost_threshold = rec_cfg.get("lost_frames_threshold", 6)
+        self.lost_threshold = 20  # Require ~700ms of sustained disappearance
         self.search_timeout = rec_cfg.get("search_timeout_sec", 3.5)
         self.sweep_amplitude = rec_cfg.get("sweep_amplitude_deg", 20.0)
         self.sweep_frequency = rec_cfg.get("sweep_frequency_hz", 0.6)
@@ -191,6 +191,9 @@ class VisionVLMAgent:
         self._search_anchor_pan = 90.0
         self._search_anchor_tilt = 75.0
         self._last_known_heading = 1.0  # +1.0 for right, -1.0 for left
+        
+        self._lock_established_time = 0.0
+        self._has_acquired_lock = False
         
         # Add Session init
         npu_cfg = self.config.get("vision", {}).get("npu", {})
@@ -245,9 +248,9 @@ class VisionVLMAgent:
             self._search_anchor_pan = self.virtual_pan
             self._search_anchor_tilt = self.virtual_tilt
             
-            self._tracking_start_time = time.time()
-            self._has_acquired_at_least_once = False
-        logger.info(f"[VisionAgent] Tracking ENGAGED for '{self.current_prompt}'. Search counters zeroed.")
+            self._track_engage_time = time.time()
+            self._has_acquired_lock = False
+        logger.info(f"[VisionAgent] Tracking ENGAGED for '{self.current_prompt}' at anchor ({self.virtual_pan:.1f}, {self.virtual_tilt:.1f}).")
 
     def stop_tracking(self):
         self.handle_stop_or_home()
@@ -262,7 +265,13 @@ class VisionVLMAgent:
             self._consecutive_lost = 0
             self._prev_error_x = None
             self._prev_error_y = None
-        logger.info("[VisionAgent] Tracking actively DISARMED by Home/Stop command.")
+            
+            # Sync setpoints to base home position
+            self.virtual_pan = 90.0
+            self.virtual_tilt = 75.0
+            self.last_cmd_pan = 90
+            self.last_cmd_tilt = 75
+        logger.info("[VisionAgent] Tracking actively DISARMED by Home/Stop command, setpoints reset to (90, 75).")
 
     def _capture_worker(self):
         """Runs at full sensor FPS (~30Hz), keeping preview responsive and low-latency."""
@@ -419,7 +428,10 @@ class VisionVLMAgent:
 
             # Handle detection state transitions
             if matched is not None:
-                self._has_acquired_at_least_once = True
+                if not self._has_acquired_lock:
+                    self._lock_established_time = now
+                    self._has_acquired_lock = True
+
                 # Target found: abort search mode if active
                 with self._tracking_lock:
                     if self._is_searching:
@@ -457,9 +469,15 @@ class VisionVLMAgent:
                     self._prev_error_y = None
                     self._consecutive_lost += 1
 
-                if self.recovery_enabled and self._has_acquired_at_least_once:
-                    if self._consecutive_lost >= self.lost_threshold:
-                        self._execute_search_sweep(now)
+                track_age = now - getattr(self, "_track_engage_time", now)
+                lock_duration = now - getattr(self, "_lock_established_time", now)
+                
+                if (self.recovery_enabled and 
+                    self._has_acquired_lock and 
+                    lock_duration > 1.0 and 
+                    track_age > 1.5 and 
+                    self._consecutive_lost >= self.lost_threshold):
+                    self._execute_search_sweep(now)
 
             time.sleep(0.010)
 
