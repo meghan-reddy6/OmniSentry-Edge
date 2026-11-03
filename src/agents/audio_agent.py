@@ -167,10 +167,13 @@ class AudioSensingAgent:
         self._last_detection_time = 0.0
 
         model_path = kws_cfg.get("model_path", "models/kws_model.onnx")
-        providers = [
-            ("QNNExecutionProvider", {"backend_type": "htp"}),
-            "CPUExecutionProvider"
-        ]
+        available_eps = ort.get_available_providers()
+        qnn_options = {
+            "backend_path": "/usr/lib/libQnnHtp.so",
+            "htp_performance_mode": "high_performance",
+            "profiling_level": "off"
+        }
+        providers = [("QNNExecutionProvider", qnn_options), "CPUExecutionProvider"] if "QNNExecutionProvider" in available_eps else ["CPUExecutionProvider"]
         try:
             self.session = ort.InferenceSession(model_path, providers=providers)
             logger.info(f"[AudioAgent] KWS loaded on {self.session.get_providers()}")
@@ -191,37 +194,89 @@ class AudioSensingAgent:
         def _callback(indata, frames, time_info, status):
             if status:
                 logger.warning(f"[AudioAgent] Stream status: {status}")
-            # Non-blocking callback: pushes raw pointer to thread-safe queue
             clean_chunk = np.nan_to_num(indata, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Resample dynamically if audio stream is running at non-16kHz rate
+            ratio = getattr(self, "_resample_ratio", 1.0)
+            if ratio != 1.0:
+                orig_len = len(clean_chunk)
+                target_len = int(round(orig_len * ratio))
+                if target_len > 0 and orig_len > 1:
+                    idx_orig = np.linspace(0, orig_len - 1, target_len)
+                    idx_base = np.arange(orig_len)
+                    if clean_chunk.ndim == 2:
+                        clean_chunk = np.column_stack([
+                            np.interp(idx_orig, idx_base, clean_chunk[:, ch])
+                            for ch in range(clean_chunk.shape[1])
+                        ])
+                    else:
+                        clean_chunk = np.interp(idx_orig, idx_base, clean_chunk)
+
             self._raw_queue.put(clean_chunk.copy())
 
-        try:
-            dev_info = sd.query_devices(device_idx, 'input')
-            max_in = dev_info.get('max_input_channels', 2)
-            stream_channels = min(self.channels, max_in)
-            if stream_channels < 1:
-                raise RuntimeError("No input channels available on device")
-
-            if stream_channels == 1 and self.channels == 2:
-                self._is_simulated_stereo = True
-                logger.info("[AudioAgent] Single-channel hardware detected. Enabled acoustic perturbation simulation for DOA.")
-            else:
-                self._is_simulated_stereo = False
-
-            self.stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=stream_channels,
-                device=device_idx,
-                blocksize=self.chunk_size,
-                latency='low',
-                callback=_callback,
-                dtype="float32"
-            )
-            self.stream.start()
-            logger.info(f"[AudioAgent] INMP441 stream active @ {self.sample_rate}Hz ({self.channels}ch)")
-        except Exception as e:
-            logger.error(f"[AudioAgent] Hardware audio stream failed: {e}")
+        if sd is None:
+            logger.warning("[AudioAgent] sounddevice not available. Running in simulated audio mode.")
             self.stream = None
+            return
+
+        # Build list of devices to try: requested index, default input, and None (system default)
+        candidates = []
+        if device_idx is not None:
+            candidates.append(device_idx)
+        try:
+            default_in = sd.default.device[0] if sd.default.device else None
+            if default_in is not None and default_in not in candidates:
+                candidates.append(default_in)
+        except Exception:
+            pass
+        if None not in candidates:
+            candidates.append(None)
+
+        self.stream = None
+        for dev in candidates:
+            try:
+                dev_info = sd.query_devices(dev, 'input') if dev is not None else sd.query_devices(kind='input')
+                max_in = dev_info.get('max_input_channels', 2)
+                stream_channels = min(self.channels, max_in)
+                if stream_channels < 1:
+                    continue
+
+                self._is_simulated_stereo = (stream_channels == 1 and self.channels == 2)
+                dev_default_sr = int(dev_info.get('default_samplerate', self.sample_rate))
+
+                # Try requested rate first, then device's native rate, then common rates
+                rates_to_try = [self.sample_rate]
+                if dev_default_sr not in rates_to_try:
+                    rates_to_try.append(dev_default_sr)
+                for common_sr in (48000, 44100):
+                    if common_sr not in rates_to_try:
+                        rates_to_try.append(common_sr)
+
+                for test_sr in rates_to_try:
+                    try:
+                        block_sz = int(round(self.chunk_size * (test_sr / self.sample_rate)))
+                        self.stream = sd.InputStream(
+                            samplerate=test_sr,
+                            channels=stream_channels,
+                            device=dev,
+                            blocksize=block_sz,
+                            latency='low',
+                            callback=_callback,
+                            dtype="float32"
+                        )
+                        self.stream.start()
+                        self._resample_ratio = self.sample_rate / float(test_sr)
+                        dev_name = dev_info.get('name', 'Default')
+                        logger.info(f"[AudioAgent] Audio stream active on '{dev_name}' (device {dev}) @ {test_sr}Hz -> {self.sample_rate}Hz ({stream_channels}ch)")
+                        return
+                    except Exception as rate_err:
+                        self.stream = None
+                        continue
+            except Exception as dev_err:
+                continue
+
+        logger.warning("[AudioAgent] Physical audio capture initialization failed. Running in audio simulation mode.")
+        self.stream = None
 
     def _prepare_tensor(self, features):
         onnx_type = self.input_info.type

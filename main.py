@@ -104,7 +104,10 @@ async def terminal_cli_worker(bus: EventBus, config: SystemConfig, shutdown_even
                 bus.publish(ManualJogCommand(pan_delta=d_pan, tilt_delta=d_tilt))
 
             elif cmd == "track" and len(parts) > 1:
-                bus.publish(TrackCommand(prompt=" ".join(parts[1:])))
+                prompt = " ".join(parts[1:]).strip()
+                bus.publish(SetOperatingModeCommand(mode=OperatingMode.AUTONOMOUS))
+                bus.publish(TrackCommand(prompt=prompt))
+                print(f"[*] Switched to AUTONOMOUS and tracking: '{prompt}'")
 
             elif cmd == "home":
                 bus.publish(HomeServosCommand())

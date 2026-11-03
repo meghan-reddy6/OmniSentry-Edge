@@ -197,23 +197,43 @@ class VisionVLMAgent:
         
         # Add Session init
         npu_cfg = self.config.get("vision", {}).get("npu", {})
+        vision_tracking = self.config.get("vision", {}).get("tracking", {})
         REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+        ctx_model_path = str(REPO_ROOT / "models" / "yolov8_det_ctx.onnx")
         model_cfg_path = npu_cfg.get("model_path", "models/yolov8_det.onnx")
-        model_path = str(REPO_ROOT / model_cfg_path) if not os.path.isabs(model_cfg_path) else model_cfg_path
-        
+        if os.path.exists(ctx_model_path):
+            model_path = ctx_model_path
+            logger.info(f"[VisionAgent] Using pre-compiled QNN context binary: {model_path}")
+        else:
+            model_path = str(REPO_ROOT / model_cfg_path) if not os.path.isabs(model_cfg_path) else model_cfg_path
+
+        self.model_path = model_path
+        self.conf_threshold = float(vision_tracking.get("conf_threshold", 0.35))
+        self.nms_threshold = float(vision_tracking.get("nms_iou_threshold", 0.45))
+
         available_eps = ort.get_available_providers()
+        perf_mode = npu_cfg.get("performance_mode", "high_performance")
+        if perf_mode == "burst":
+            logger.warning("[VisionAgent] 'burst' mode can trigger FastRPC latency failures on Linux. Using 'high_performance'.")
+            perf_mode = "high_performance"
+
         qnn_options = {
             "backend_path": npu_cfg.get("backend_path", "/usr/lib/libQnnHtp.so"),
-            "htp_performance_mode": npu_cfg.get("performance_mode", "burst"),
+            "htp_performance_mode": perf_mode,
             "profiling_level": "off"
         }
         providers = [("QNNExecutionProvider", qnn_options), "CPUExecutionProvider"] if "QNNExecutionProvider" in available_eps else ["CPUExecutionProvider"]
-        
+
         session_options = ort.SessionOptions()
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self._session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
+        try:
+            self._session = ort.InferenceSession(self.model_path, sess_options=session_options, providers=providers)
+            logger.info(f"[VisionAgent] InferenceSession initialized with providers: {self._session.get_providers()}")
+        except Exception as e:
+            logger.warning(f"[VisionAgent] Primary provider setup failed: {e}. Falling back to CPUExecutionProvider.")
+            self._session = ort.InferenceSession(self.model_path, sess_options=session_options, providers=["CPUExecutionProvider"])
+
         self._input_name = self._session.get_inputs()[0].name
-        self.nms_threshold = tracking.get("nms_iou_threshold", 0.45)
 
         if hasattr(self.bus, 'subscribe'):
             self.bus.subscribe("TrackCommand", self.handle_track_command)
@@ -334,10 +354,24 @@ class VisionVLMAgent:
         blob = np.transpose(rgb_frame, (2, 0, 1))
         blob = np.expand_dims(blob, axis=0).astype(np.uint8)
 
-        raw_outputs = self._session.run(None, {self._input_name: blob})
+        try:
+            raw_outputs = self._session.run(None, {self._input_name: blob})
+        except Exception as e:
+            logger.error(f"[VisionAgent] NPU inference failed ({e}). Falling back to CPUExecutionProvider...")
+            try:
+                session_options = ort.SessionOptions()
+                session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                self._session = ort.InferenceSession(self.model_path, sess_options=session_options, providers=["CPUExecutionProvider"])
+                self._input_name = self._session.get_inputs()[0].name
+                logger.info("[VisionAgent] Switched to CPUExecutionProvider successfully.")
+                raw_outputs = self._session.run(None, {self._input_name: blob})
+            except Exception as cpu_err:
+                logger.error(f"[VisionAgent] Fallback inference also failed: {cpu_err}")
+                return []
+
         boxes, confs, classes, labels = decode_detections(
             raw_outputs, w, h,
-            conf_thresh=0.55,
+            conf_thresh=self.conf_threshold,
             nms_thresh=self.nms_threshold
         )
         return [(b, c, cid, lbl) for b, c, cid, lbl in zip(boxes, confs, classes, labels)]
@@ -405,81 +439,86 @@ class VisionVLMAgent:
     def _inference_worker(self):
         """Runs NPU detection and evaluates tracking or recovery search state."""
         while not self._stop_event.is_set():
-            with self._tracking_lock:
-                is_active = self.is_tracking_active
-                prompt = self.current_prompt
+            try:
+                with self._tracking_lock:
+                    is_active = self.is_tracking_active
+                    prompt = self.current_prompt
 
-            if not is_active or not prompt:
-                time.sleep(0.03)
-                continue
-
-            with self._frame_lock:
-                if self._tensor_frame is None:
-                    time.sleep(0.005)
+                if not is_active or not prompt:
+                    time.sleep(0.03)
                     continue
-                infer_frame = self._tensor_frame.copy()
-                ratio, pad_w, pad_h = self._pad_info
 
-            h, w = infer_frame.shape[:2]
-            detections = self._run_npu_detection(infer_frame)
-            matched = self._select_locked_target(detections, prompt)
+                with self._frame_lock:
+                    if self._tensor_frame is None:
+                        time.sleep(0.005)
+                        continue
+                    infer_frame = self._tensor_frame.copy()
+                    ratio, pad_w, pad_h = self._pad_info
 
-            now = time.time()
+                h, w = infer_frame.shape[:2]
+                detections = self._run_npu_detection(infer_frame)
+                matched = self._select_locked_target(detections, prompt)
 
-            # Handle detection state transitions
-            if matched is not None:
-                if not self._has_acquired_lock:
-                    self._lock_established_time = now
-                    self._has_acquired_lock = True
+                now = time.time()
 
-                # Target found: abort search mode if active
-                with self._tracking_lock:
-                    if self._is_searching:
-                        logger.info(f"[VisionAgent] Target '{prompt}' RE-ACQUIRED! Resuming closed-loop track.")
-                        self._is_searching = False
+                # Handle detection state transitions
+                if matched is not None:
+                    if not self._has_acquired_lock:
+                        self._lock_established_time = now
+                        self._has_acquired_lock = True
 
-                    self._consecutive_lost = 0
-                    bx, by, bw, bh = matched
-                    # Clamp bounding box within active sensor region
-                    bx = max(int(pad_w), min(w - int(pad_w) - 1, bx))
-                    by = max(int(pad_h), min(h - int(pad_h) - 1, by))
-                    bw = max(1, min(w - int(pad_w) - bx, bw))
-                    bh = max(1, min(h - int(pad_h) - by, bh))
+                    # Target found: abort search mode if active
+                    with self._tracking_lock:
+                        if self._is_searching:
+                            logger.info(f"[VisionAgent] Target '{prompt}' RE-ACQUIRED! Resuming closed-loop track.")
+                            self._is_searching = False
 
-                    raw_box = np.array([bx, by, bw, bh], dtype=np.float32)
-                    if self.smooth_box is None:
-                        self.smooth_box = raw_box
-                    else:
-                        self.smooth_box = 0.50 * raw_box + 0.50 * self.smooth_box
-                    self.locked_box = [int(v) for v in self.smooth_box]
+                        self._consecutive_lost = 0
+                        bx, by, bw, bh = matched
+                        # Clamp bounding box within active sensor region
+                        bx = max(int(pad_w), min(w - int(pad_w) - 1, bx))
+                        by = max(int(pad_h), min(h - int(pad_h) - 1, by))
+                        bw = max(1, min(w - int(pad_w) - bx, bw))
+                        bh = max(1, min(h - int(pad_h) - by, bh))
 
-                    # Track horizontal departure heading
-                    cx = bx + bw / 2.0
-                    if abs(cx - (w / 2.0)) > 15:
-                        self._last_known_heading = 1.0 if cx > (w / 2.0) else -1.0
+                        raw_box = np.array([bx, by, bw, bh], dtype=np.float32)
+                        if self.smooth_box is None:
+                            self.smooth_box = raw_box
+                        else:
+                            self.smooth_box = 0.50 * raw_box + 0.50 * self.smooth_box
+                        self.locked_box = [int(v) for v in self.smooth_box]
 
-                self._compute_and_dispatch_step(w, h)
+                        # Track horizontal departure heading
+                        cx = bx + bw / 2.0
+                        if abs(cx - (w / 2.0)) > 15:
+                            self._last_known_heading = 1.0 if cx > (w / 2.0) else -1.0
 
-            else:
-                # Target missing in this frame
-                with self._tracking_lock:
-                    self.locked_box = None
-                    self.smooth_box = None
-                    self._prev_error_x = None
-                    self._prev_error_y = None
-                    self._consecutive_lost += 1
+                    self._compute_and_dispatch_step(w, h)
 
-                track_age = now - getattr(self, "_track_engage_time", now)
-                lock_duration = now - getattr(self, "_lock_established_time", now)
-                
-                if (self.recovery_enabled and 
-                    self._has_acquired_lock and 
-                    lock_duration > 1.0 and 
-                    track_age > 1.5 and 
-                    self._consecutive_lost >= self.lost_threshold):
-                    self._execute_search_sweep(now)
+                else:
+                    # Target missing in this frame
+                    with self._tracking_lock:
+                        self.locked_box = None
+                        self.smooth_box = None
+                        self._prev_error_x = None
+                        self._prev_error_y = None
+                        self._consecutive_lost += 1
 
-            time.sleep(0.010)
+                    track_age = now - getattr(self, "_track_engage_time", now)
+                    lock_duration = now - getattr(self, "_lock_established_time", now)
+                    
+                    if (self.recovery_enabled and 
+                        self._has_acquired_lock and 
+                        lock_duration > 1.0 and 
+                        track_age > 1.5 and 
+                        self._consecutive_lost >= self.lost_threshold):
+                        self._execute_search_sweep(now)
+
+                time.sleep(0.010)
+
+            except Exception as e:
+                logger.error(f"[VisionAgent] Error in inference worker loop: {e}", exc_info=True)
+                time.sleep(0.05)
 
     def _execute_search_sweep(self, now):
         """Executes a bounded sinusoidal sweep around the last target anchor."""
@@ -488,24 +527,29 @@ class VisionVLMAgent:
                 self._is_searching = True
                 self._search_start_time = now
                 self._search_anchor_pan = self.virtual_pan
-                self._search_anchor_tilt = self.virtual_tilt
-                logger.info(f"[VisionAgent] Target lost. Initiating recovery sweep (anchor: {self._search_anchor_pan:.1f} deg)")
+                # Lock tilt to horizon during sweep so it looks forward/down at ground level
+                self._search_anchor_tilt = min(self.virtual_tilt, 75.0)
+                logger.info(f"[VisionAgent] Initiating recovery sweep at horizon tilt {self._search_anchor_tilt:.1f} deg")
 
             elapsed = now - self._search_start_time
             if elapsed > self.search_timeout:
                 logger.info("[VisionAgent] Search sweep timed out without target. Resetting to standby.")
                 self._is_searching = False
-                self.is_tracking_active = False
-                self.current_prompt = None
+                self._has_acquired_lock = False
+                self.virtual_pan = 90.0
+                self.virtual_tilt = 75.0
+                self.bus.publish(MoveServoCommand(pan=90, tilt=75))
                 return
 
             # Sinusoidal sweep biased toward the target's departure heading
             sweep_offset = self.sweep_amplitude * math.sin(2.0 * math.pi * self.sweep_frequency * elapsed) * self._last_known_heading
             target_pan = max(self.pan_min, min(self.pan_max, self._search_anchor_pan + sweep_offset))
-            target_tilt = self._search_anchor_tilt
+
+            self.virtual_pan = target_pan
+            self.virtual_tilt = self._search_anchor_tilt
 
             cmd_p = int(round(target_pan))
-            cmd_t = int(round(target_tilt))
+            cmd_t = int(round(self._search_anchor_tilt))
 
             if cmd_p != self.last_cmd_pan or cmd_t != self.last_cmd_tilt:
                 self.last_cmd_pan = cmd_p
@@ -530,25 +574,25 @@ class VisionVLMAgent:
         # Notify orchestrator of active tracking
         self.bus.publish(VisualTargetOffsetEvent(offset_x=err_x, offset_y=err_y))
 
-        # Pan: Target to the right (err_x > 0) requires camera to pan right
+        # Pan: object to the right (err_x > 0) -> pan decreases (or increases depending on gear)
         delta_pan = 0.0
         if abs(err_x) > self.deadband_x:
             delta_pan = -self.kp_pan * err_x * self.max_step
 
-        # Tilt: Target below center (err_y > 0) requires camera to tilt down
+        # Tilt: object below center (err_y > 0) -> tilt decreases to look down
         delta_tilt = 0.0
         if abs(err_y) > self.deadband_y:
-            delta_tilt = self.kp_tilt * err_y * self.max_step
+            delta_tilt = -self.kp_tilt * err_y * self.max_step  # Negative sign commands downward tilt
 
-        if abs(delta_pan) > 0.1 or abs(delta_tilt) > 0.1:
+        if abs(delta_pan) > 0.05 or abs(delta_tilt) > 0.05:
             # Update virtual setpoints
             self.virtual_pan = max(self.pan_min, min(self.pan_max, self.virtual_pan + delta_pan))
             self.virtual_tilt = max(self.tilt_min, min(self.tilt_max, self.virtual_tilt + delta_tilt))
 
-            cmd_p = int(round(self.virtual_pan))
-            cmd_t = int(round(self.virtual_tilt))
+            cmd_p = round(self.virtual_pan, 1)
+            cmd_t = round(self.virtual_tilt, 1)
 
-            if cmd_p != self.last_cmd_pan or cmd_t != self.last_cmd_tilt:
+            if abs(cmd_p - self.last_cmd_pan) >= 0.5 or abs(cmd_t - self.last_cmd_tilt) >= 0.5:
                 self.last_cmd_pan = cmd_p
                 self.last_cmd_tilt = cmd_t
                 self._last_servo_time = now

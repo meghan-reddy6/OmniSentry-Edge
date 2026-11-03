@@ -17,8 +17,8 @@ vision:
 
   npu:
     model_path: "models/yolov8_det.onnx"
-    backend_type: "htp"
-    performance_mode: "burst"
+    backend_path: "/usr/lib/libQnnHtp.so"
+    performance_mode: "high_performance"
     profiling_level: "off"
     intra_op_threads: 2
     inter_op_threads: 1
@@ -26,7 +26,7 @@ vision:
     input_height: 640
 
   tracking:
-    conf_threshold: 0.40
+    conf_threshold: 0.35
     nms_iou_threshold: 0.45
     inference_fps_limit: 20
 
@@ -53,7 +53,7 @@ servos:
   i2c_address: 0x40
   pwm_frequency: 50
   update_rate_hz: 15          # Max physical update frequency (66ms interval)
-  min_angle_change_deg: 1.5   # Physical deadband: suppresses micro-jitter below 1.5 deg
+  min_angle_change_deg: 0.5   # Physical deadband: suppresses micro-jitter below 0.5 deg
 
   pan:
     channel: 0
@@ -67,7 +67,7 @@ servos:
     base_angle: 75
     min_angle: 40
     max_angle: 125
-    invert: true              # Centralized mechanical inversion for tilt axis
+    invert: false             # Set to false to match physical servo linkage
 
   tracking:
     kp_pan: 2.0

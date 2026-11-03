@@ -19,7 +19,7 @@ class ServoActuatorAgent:
         self.pan_cfg = servo_cfg.get("pan", {})
         self.tilt_cfg = servo_cfg.get("tilt", {})
 
-        self.min_angle_change = float(servo_cfg.get("min_angle_change_deg", 1.5))
+        self.min_angle_change = float(servo_cfg.get("min_angle_change_deg", 0.5))
         self.min_interval = 1.0 / float(servo_cfg.get("update_rate_hz", 15))
 
         # Initial live angles
@@ -77,13 +77,13 @@ class ServoActuatorAgent:
         hw_pan = (180.0 - clamped_pan) if self.pan_cfg.get("invert", False) else clamped_pan
         hw_tilt = (180.0 - clamped_tilt) if self.tilt_cfg.get("invert", False) else clamped_tilt
 
-        self._write_pca9685(int(round(hw_pan)), int(round(hw_tilt)))
+        self._write_pca9685(round(hw_pan, 1), round(hw_tilt, 1))
 
-    def _write_pca9685(self, pan: int, tilt: int):
+    def _write_pca9685(self, pan: float, tilt: float):
         if self.mode == 'simulation':
-            logger.debug(f"[SERVO ] Write -> Pan:{pan:3d} deg Tilt:{tilt:3d} deg (was P:{int(self.current_pan):3d} deg T:{int(self.current_tilt):3d} deg)")
+            logger.debug(f"[SERVO ] Write -> Pan:{pan:5.1f} deg Tilt:{tilt:5.1f} deg (was P:{self.current_pan:5.1f} deg T:{self.current_tilt:5.1f} deg)")
         else:
-            logger.info(f"[ServoAgent] Hardware Write -> Pan: {pan} deg, Tilt: {tilt} deg (was {self.current_pan} deg, {self.current_tilt} deg)")
+            logger.info(f"[ServoAgent] Hardware Write -> Pan: {pan:.1f} deg, Tilt: {tilt:.1f} deg (was {self.current_pan:.1f} deg, {self.current_tilt:.1f} deg)")
 
         if self.mode == "hardware" and self.driver:
             try:
