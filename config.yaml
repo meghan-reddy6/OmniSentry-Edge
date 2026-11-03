@@ -17,17 +17,23 @@ vision:
 
   npu:
     model_path: "models/yolov8_det.onnx"
-    backend_path: "/usr/lib/libQnnHtp.so"
-    profiling_level: "off"
-    intra_op_threads: 2
-    inter_op_threads: 1
+    backend_path: "libQnnHtp.so"
+    performance_mode: "default"         # Critical: Bypasses unsupported latency option 3
+    rpc_control_latency: "0"            # Disables RPC polling latency overrides
+    use_context_binary: false           # Bypasses stale burst context binary
+    intra_op_threads: 0                 # 0 allows dynamic thread scaling across available cores
+    inter_op_threads: 0
     input_width: 640
     input_height: 640
+
+  inference_fps_limit: 20.0
+  conf_threshold: 0.35
+  nms_threshold: 0.45
 
   tracking:
     conf_threshold: 0.35
     nms_iou_threshold: 0.45
-    inference_fps_limit: 20
+    inference_fps_limit: 20.0
 
 audio:
   enabled: true               # Master switch: set to false to completely disable microphone stream and audio processing

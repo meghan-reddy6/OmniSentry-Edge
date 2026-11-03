@@ -138,6 +138,7 @@ class VisionVLMAgent:
         self._frame_lock = threading.Lock()
         self._tracking_lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._new_frame_event = threading.Event()
 
         self._tensor_frame = None
         self._preview_jpeg = None
@@ -196,42 +197,60 @@ class VisionVLMAgent:
         self._has_acquired_lock = False
         
         # Add Session init
-        npu_cfg = self.config.get("vision", {}).get("npu", {})
-        vision_tracking = self.config.get("vision", {}).get("tracking", {})
+        self.npu_config = self.config.get("vision", {}).get("npu", {})
+        vision_cfg = self.config.get("vision", {})
+        vision_tracking = vision_cfg.get("tracking", {})
         REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-        model_cfg_path = npu_cfg.get("model_path", "models/yolov8_det.onnx")
+        model_cfg_path = self.npu_config.get("model_path", "models/yolov8_det.onnx")
         self.base_model_path = str(REPO_ROOT / model_cfg_path) if not os.path.isabs(model_cfg_path) else model_cfg_path
 
+        use_ctx = self.npu_config.get("use_context_binary", False)
         ctx_model_path = str(REPO_ROOT / "models" / "yolov8_det_ctx.onnx")
-        if os.path.exists(ctx_model_path):
+        if use_ctx and os.path.exists(ctx_model_path):
             self.model_path = ctx_model_path
             logger.info(f"[VisionAgent] Using pre-compiled QNN context binary: {self.model_path}")
         else:
             self.model_path = self.base_model_path
-            logger.info(f"[VisionAgent] Using base model: {self.model_path}")
+            logger.info(f"[VisionAgent] Using base model directly on Hexagon NPU: {self.model_path}")
 
-        self.conf_threshold = float(vision_tracking.get("conf_threshold", 0.35))
-        self.nms_threshold = float(vision_tracking.get("nms_iou_threshold", 0.45))
+        self.conf_threshold = float(vision_cfg.get("conf_threshold", vision_tracking.get("conf_threshold", 0.35)))
+        self.nms_threshold = float(vision_cfg.get("nms_threshold", vision_tracking.get("nms_iou_threshold", 0.45)))
+        self.inference_fps_limit = float(vision_cfg.get("inference_fps_limit", vision_tracking.get("inference_fps_limit", 20.0)))
+
+        backend_path = self.npu_config.get("backend_path", "libQnnHtp.so")
+        qnn_options = {
+            "backend_path": backend_path,
+            "rpc_control_latency": "0",
+            "htp_performance_mode": "default",
+        }
 
         available_eps = ort.get_available_providers()
-        # Omit htp_performance_mode to avoid FastRPC SetRpcPowerConfigs ioctl failure on Linux
-        qnn_options = {
-            "backend_path": npu_cfg.get("backend_path", "/usr/lib/libQnnHtp.so"),
-            "profiling_level": "off"
-        }
-        providers = [("QNNExecutionProvider", qnn_options), "CPUExecutionProvider"] if "QNNExecutionProvider" in available_eps else ["CPUExecutionProvider"]
+        if "QNNExecutionProvider" in available_eps:
+            providers = ["QNNExecutionProvider"]
+            provider_options = [qnn_options]
+        else:
+            logger.warning("[VisionAgent] QNNExecutionProvider not present in environment; using CPUExecutionProvider for simulation.")
+            providers = ["CPUExecutionProvider"]
+            provider_options = [{}]
 
         session_options = ort.SessionOptions()
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        try:
-            self._session = ort.InferenceSession(self.model_path, sess_options=session_options, providers=providers)
-            logger.info(f"[VisionAgent] InferenceSession initialized with providers: {self._session.get_providers()}")
-        except Exception as e:
-            logger.warning(f"[VisionAgent] Primary provider setup failed: {e}. Falling back to CPUExecutionProvider on base model.")
-            self.model_path = self.base_model_path
-            self._session = ort.InferenceSession(self.base_model_path, sess_options=session_options, providers=["CPUExecutionProvider"])
+        session_options.intra_op_num_threads = 0  # Allow dynamic thread scaling across available cores
+        session_options.inter_op_num_threads = 0
+
+        self._session = ort.InferenceSession(
+            self.model_path,
+            sess_options=session_options,
+            providers=providers,
+            provider_options=provider_options
+        )
+        logger.info(f"[VisionAgent] InferenceSession initialized with providers: {self._session.get_providers()}")
 
         self._input_name = self._session.get_inputs()[0].name
+
+        self._run_options = ort.RunOptions()
+        self._run_options.add_run_config_entry("qnn.rpc_control_latency", "0")
+        self._run_options.add_run_config_entry("qnn.htp_perf_mode", "default")
 
         if hasattr(self.bus, 'subscribe'):
             self.bus.subscribe("TrackCommand", self.handle_track_command)
@@ -268,6 +287,7 @@ class VisionVLMAgent:
             
             self._track_engage_time = time.time()
             self._has_acquired_lock = False
+        self._new_frame_event.set()
         logger.info(f"[VisionAgent] Tracking ENGAGED for '{self.current_prompt}' at anchor ({self.virtual_pan:.1f}, {self.virtual_tilt:.1f}).")
 
     def stop_tracking(self):
@@ -295,9 +315,8 @@ class VisionVLMAgent:
         """Runs at full sensor FPS (~30Hz), keeping preview responsive and low-latency."""
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
         while not self._stop_event.is_set():
-            ret, raw_frame = self.camera.read_fresh_frame()
+            ret, raw_frame = self.camera.read_fresh_frame(wait=True, timeout=0.05)
             if not ret or raw_frame is None:
-                time.sleep(0.003)
                 continue
 
             # Aspect-preserving letterbox to 640x640
@@ -306,6 +325,9 @@ class VisionVLMAgent:
             with self._frame_lock:
                 self._tensor_frame = letter_frame
                 self._pad_info = (ratio, pad_w, pad_h)
+
+            # Signal inference worker that a fresh frame is available
+            self._new_frame_event.set()
 
             # Build preview frame immediately without waiting for inference
             preview = letter_frame.copy()
@@ -344,46 +366,22 @@ class VisionVLMAgent:
                 with self._frame_lock:
                     self._preview_jpeg = jpeg.tobytes()
 
-            time.sleep(0.008)
-
     def _run_npu_detection(self, infer_frame):
         h, w = infer_frame.shape[:2]
         rgb_frame = cv2.cvtColor(infer_frame, cv2.COLOR_BGR2RGB)
         blob = np.transpose(rgb_frame, (2, 0, 1))
-        blob = np.expand_dims(blob, axis=0).astype(np.uint8)
+        blob = np.expand_dims(blob, axis=0)
+        blob = np.ascontiguousarray(blob, dtype=np.uint8)
 
         try:
-            raw_outputs = self._session.run(None, {self._input_name: blob})
+            raw_outputs = self._session.run(
+                None,
+                {self._input_name: blob},
+                run_options=self._run_options
+            )
         except Exception as e:
-            logger.error(f"[VisionAgent] NPU inference failed ({e}). Falling back to CPUExecutionProvider...")
-            try:
-                # If QNN failed on context binary, try base model on QNN first
-                if self.model_path != self.base_model_path:
-                    try:
-                        self.model_path = self.base_model_path
-                        session_options = ort.SessionOptions()
-                        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                        qnn_options = {"backend_path": "/usr/lib/libQnnHtp.so"}
-                        self._session = ort.InferenceSession(self.base_model_path, sess_options=session_options, providers=[("QNNExecutionProvider", qnn_options)])
-                        self._input_name = self._session.get_inputs()[0].name
-                        raw_outputs = self._session.run(None, {self._input_name: blob})
-                        logger.info("[VisionAgent] Base model running on QNNExecutionProvider successfully!")
-                        boxes, confs, classes, labels = decode_detections(raw_outputs, w, h, conf_thresh=self.conf_threshold, nms_thresh=self.nms_threshold)
-                        return [(b, c, cid, lbl) for b, c, cid, lbl in zip(boxes, confs, classes, labels)]
-                    except Exception:
-                        pass
-
-                # Fall back to CPU using base model (never pass context binary with EPContext to CPU)
-                session_options = ort.SessionOptions()
-                session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                self.model_path = self.base_model_path
-                self._session = ort.InferenceSession(self.base_model_path, sess_options=session_options, providers=["CPUExecutionProvider"])
-                self._input_name = self._session.get_inputs()[0].name
-                logger.info("[VisionAgent] Switched to CPUExecutionProvider on base model successfully.")
-                raw_outputs = self._session.run(None, {self._input_name: blob})
-            except Exception as cpu_err:
-                logger.error(f"[VisionAgent] Fallback inference also failed: {cpu_err}")
-                return []
+            logger.error(f"[VisionAgent] NPU inference execution failed: {e}")
+            return []
 
         boxes, confs, classes, labels = decode_detections(
             raw_outputs, w, h,
@@ -453,20 +451,26 @@ class VisionVLMAgent:
         return matching_boxes[0][0]
 
     def _inference_worker(self):
-        """Runs NPU detection and evaluates tracking or recovery search state."""
+        """Runs NPU detection and evaluates tracking or recovery search state, driven directly by frame arrival."""
         while not self._stop_event.is_set():
             try:
+                # Block until a fresh frame arrives from the capture buffer (zero CPU busy-waiting)
+                if not self._new_frame_event.wait(timeout=0.05):
+                    continue
+                self._new_frame_event.clear()
+
+                if self._stop_event.is_set():
+                    break
+
                 with self._tracking_lock:
                     is_active = self.is_tracking_active
                     prompt = self.current_prompt
 
                 if not is_active or not prompt:
-                    time.sleep(0.03)
                     continue
 
                 with self._frame_lock:
                     if self._tensor_frame is None:
-                        time.sleep(0.005)
                         continue
                     infer_frame = self._tensor_frame.copy()
                     ratio, pad_w, pad_h = self._pad_info
@@ -530,11 +534,9 @@ class VisionVLMAgent:
                         self._consecutive_lost >= self.lost_threshold):
                         self._execute_search_sweep(now)
 
-                time.sleep(0.010)
-
             except Exception as e:
                 logger.error(f"[VisionAgent] Error in inference worker loop: {e}", exc_info=True)
-                time.sleep(0.05)
+                time.sleep(0.01)
 
     def _execute_search_sweep(self, now):
         """Executes a bounded sinusoidal sweep around the last target anchor."""
@@ -624,9 +626,10 @@ class VisionVLMAgent:
 
     async def stop(self):
         self._stop_event.set()
+        self._new_frame_event.set()
         self.camera.release()
         # Clean ONNX session handle to prevent FastRPC graph errors on Hexagon NPU
-        if hasattr(self, "session") and self.session is not None:
+        if hasattr(self, "_session") and self._session is not None:
             logger.info("[VisionAgent] Releasing ONNX inference session...")
-            del self.session
-            self.session = None
+            del self._session
+            self._session = None

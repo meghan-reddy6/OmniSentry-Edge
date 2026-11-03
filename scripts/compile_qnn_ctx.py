@@ -20,16 +20,16 @@ so.add_session_config_entry("ep.context_enable", "1")
 so.add_session_config_entry("ep.context_file_path", CTX_OUT)
 so.add_session_config_entry("ep.context_embed_mode", "1")
 
-providers = [
-    ("QNNExecutionProvider", {
-        "backend_path": "/usr/lib/libQnnHtp.so",
-        "htp_graph_finalization_optimization_mode": "3",
-        "profiling_level": "off"
-    })
-]
+providers = ["QNNExecutionProvider"]
+provider_options = [{
+    "backend_path": "libQnnHtp.so",
+    "htp_performance_mode": "default",
+    "rpc_control_latency": "0",
+    "profiling_level": "off"
+}]
 
 try:
-    sess = ort.InferenceSession(MODEL_IN, sess_options=so, providers=providers)
+    sess = ort.InferenceSession(MODEL_IN, sess_options=so, providers=providers, provider_options=provider_options)
     print(f"[Compiler]: SUCCESS! Serialized context model generated at {CTX_OUT}")
 except Exception as e:
     print(f"[Compiler]: Compilation failed: {e}")

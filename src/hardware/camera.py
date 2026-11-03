@@ -24,6 +24,7 @@ class CameraStream:
 
         self._latest_raw = None
         self._lock = threading.Lock()
+        self._new_frame_event = threading.Event()
         self._running = True
 
         # Dedicated thread continuously drains the V4L2 driver queue
@@ -44,17 +45,25 @@ class CameraStream:
             if ret and frame is not None:
                 with self._lock:
                     self._latest_raw = frame
+                self._new_frame_event.set()
 
-    def read_fresh_frame(self):
+    def read_fresh_frame(self, wait=False, timeout=0.05):
         """Returns the latest frame with zero driver-queue latency."""
+        if wait and hasattr(self, "_new_frame_event"):
+            new_arrived = self._new_frame_event.wait(timeout=timeout)
+            self._new_frame_event.clear()
+            if not new_arrived:
+                return False, None
         with self._lock:
-            if self._latest_raw is None:
+            if getattr(self, "_latest_raw", None) is None:
                 return False, None
             return True, self._latest_raw.copy()
 
     def release(self):
         self._running = False
-        if self._drain_thread.is_alive():
+        if hasattr(self, "_new_frame_event"):
+            self._new_frame_event.set()
+        if hasattr(self, "_drain_thread") and self._drain_thread.is_alive():
             self._drain_thread.join(timeout=1.0)
-        if self.cap and self.cap.isOpened():
+        if hasattr(self, "cap") and self.cap and self.cap.isOpened():
             self.cap.release()
