@@ -18,8 +18,6 @@ vision:
   npu:
     model_path: "models/yolov8_det.onnx"
     backend_path: "libQnnHtp.so"
-    performance_mode: "default"         # Critical: Bypasses unsupported latency option 3
-    rpc_control_latency: "0"            # Disables RPC polling latency overrides
     use_context_binary: false           # Bypasses stale burst context binary
     intra_op_threads: 0                 # 0 allows dynamic thread scaling across available cores
     inter_op_threads: 0

@@ -23,8 +23,6 @@ so.add_session_config_entry("ep.context_embed_mode", "1")
 providers = ["QNNExecutionProvider"]
 provider_options = [{
     "backend_path": "libQnnHtp.so",
-    "htp_performance_mode": "default",
-    "rpc_control_latency": "0",
     "profiling_level": "off"
 }]
 

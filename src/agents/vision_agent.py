@@ -218,10 +218,10 @@ class VisionVLMAgent:
         self.inference_fps_limit = float(vision_cfg.get("inference_fps_limit", vision_tracking.get("inference_fps_limit", 20.0)))
 
         backend_path = self.npu_config.get("backend_path", "libQnnHtp.so")
+        # Omit htp_performance_mode and rpc_control_latency to prevent FastRPC 0x32cc SetRpcPowerConfigs ioctl failure on Linux
         qnn_options = {
             "backend_path": backend_path,
-            "rpc_control_latency": "0",
-            "htp_performance_mode": "default",
+            "profiling_level": "off",
         }
 
         available_eps = ort.get_available_providers()
@@ -247,10 +247,6 @@ class VisionVLMAgent:
         logger.info(f"[VisionAgent] InferenceSession initialized with providers: {self._session.get_providers()}")
 
         self._input_name = self._session.get_inputs()[0].name
-
-        self._run_options = ort.RunOptions()
-        self._run_options.add_run_config_entry("qnn.rpc_control_latency", "0")
-        self._run_options.add_run_config_entry("qnn.htp_perf_mode", "default")
 
         if hasattr(self.bus, 'subscribe'):
             self.bus.subscribe("TrackCommand", self.handle_track_command)
@@ -376,8 +372,7 @@ class VisionVLMAgent:
         try:
             raw_outputs = self._session.run(
                 None,
-                {self._input_name: blob},
-                run_options=self._run_options
+                {self._input_name: blob}
             )
         except Exception as e:
             logger.error(f"[VisionAgent] NPU inference execution failed: {e}")
