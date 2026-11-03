@@ -30,6 +30,7 @@ vision:
     inference_fps_limit: 20
 
 audio:
+  enabled: true               # Master switch: set to false to completely disable microphone stream and audio processing
   device_index: 2             # RubikPi 3 capture hardware index
   sample_rate: 16000          # Native INMP441 I2S sampling frequency
   channels: 2                 # Stereo I2S array
@@ -38,13 +39,14 @@ audio:
   vad_gate_rms: 0.045         # Noise floor threshold above motor idle
 
   kws:
+    enabled: false            # Hard switch: set to false to disable audio neural network model (keeps logs clean & avoids FastRPC conflicts)
     model_path: "models/kws_model.onnx"
     confidence_threshold: 0.70
     consecutive_hits: 3
     cooldown_sec: 1.5
     input_scale: null          # Set numeric float if INT8/UINT8 quantized
     input_zero_point: null     # Set integer if INT8/UINT8 quantized
-    backend: "htp"             # QNN HTP acceleration
+    backend: "cpu"             # 'cpu' (clean, sub-millisecond) or 'htp' (QNN HTP NPU)
 
 servos:
   mode: "hardware"

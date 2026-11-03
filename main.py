@@ -113,7 +113,12 @@ async def terminal_cli_worker(bus: EventBus, config: SystemConfig, shutdown_even
                 bus.publish(HomeServosCommand())
                 
             elif cmd == "status":
-                print(f"Status check dispatched to orchestrator logs.")
+                audio_en = config.get("audio", {}).get("enabled", True)
+                kws_en = audio_en and config.get("audio", {}).get("kws", {}).get("enabled", False)
+                print(f"[*] Subsystem Status:")
+                print(f"    - Audio Stream: {'ONLINE' if audio_en else 'DISABLED'}")
+                print(f"    - KWS Model:    {'ONLINE' if kws_en else 'DISABLED'}")
+                print(f"    - Vision Model: ONLINE (QNN Hexagon / CPU)")
                 
             else:
                 print(f"Unknown command: '{cmd}'.")

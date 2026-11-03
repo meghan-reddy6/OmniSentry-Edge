@@ -147,6 +147,7 @@ class AudioSensingAgent:
         hw_cfg = audio_cfg.get("hardware", {})
         kws_cfg = audio_cfg.get("kws", {})
 
+        self.enabled = bool(audio_cfg.get("enabled", True))
         self.sample_rate = audio_cfg.get("sample_rate", 16000)
         self.channels = audio_cfg.get("channels", 2)
         self.chunk_size = audio_cfg.get("chunk_size", 1024)
@@ -165,23 +166,47 @@ class AudioSensingAgent:
         self._stop_event = threading.Event()
         self._recent_hits = deque(maxlen=self.consecutive_hits)
         self._last_detection_time = 0.0
+        self.session = None
+        self.input_info = None
+        self.output_info = None
 
-        self.model_path = kws_cfg.get("model_path", "models/kws_model.onnx")
-        available_eps = ort.get_available_providers()
-        qnn_options = {
-            "backend_path": "/usr/lib/libQnnHtp.so",
-            "profiling_level": "off"
-        }
-        providers = [("QNNExecutionProvider", qnn_options), "CPUExecutionProvider"] if "QNNExecutionProvider" in available_eps else ["CPUExecutionProvider"]
-        try:
-            self.session = ort.InferenceSession(self.model_path, providers=providers)
-            logger.info(f"[AudioAgent] KWS loaded on {self.session.get_providers()}")
-        except Exception as e:
-            logger.warning(f"[AudioAgent] QNN Provider failed, using CPU fallback: {e}")
-            self.session = ort.InferenceSession(self.model_path, providers=["CPUExecutionProvider"])
+        if not self.enabled:
+            self.kws_enabled = False
+            logger.info("[AudioAgent] Subsystem disabled (audio.enabled: false in config.yaml).")
+            return
 
-        self.input_info = self.session.get_inputs()[0]
-        self.output_info = self.session.get_outputs()[0]
+        self.kws_enabled = bool(kws_cfg.get("enabled", False))
+        if not self.kws_enabled:
+            logger.info("[AudioAgent] KWS neural model disabled (audio.kws.enabled: false in config.yaml). Pure acoustic TDoA localization active.")
+        else:
+            self.model_path = kws_cfg.get("model_path", "models/kws_model.onnx")
+            kws_backend = kws_cfg.get("backend", "cpu").lower()
+            available_eps = ort.get_available_providers()
+
+            if kws_backend == "htp" and "QNNExecutionProvider" in available_eps:
+                qnn_options = {
+                    "backend_path": "/usr/lib/libQnnHtp.so",
+                    "profiling_level": "off"
+                }
+                providers = [("QNNExecutionProvider", qnn_options), "CPUExecutionProvider"]
+            else:
+                providers = ["CPUExecutionProvider"]
+
+            try:
+                self.session = ort.InferenceSession(self.model_path, providers=providers)
+                self.input_info = self.session.get_inputs()[0]
+                self.output_info = self.session.get_outputs()[0]
+                logger.info(f"[AudioAgent] KWS loaded on {self.session.get_providers()}")
+            except Exception as e:
+                logger.warning(f"[AudioAgent] Primary KWS provider setup failed: {e}. Falling back to CPUExecutionProvider...")
+                try:
+                    self.session = ort.InferenceSession(self.model_path, providers=["CPUExecutionProvider"])
+                    self.input_info = self.session.get_inputs()[0]
+                    self.output_info = self.session.get_outputs()[0]
+                except Exception as cpu_err:
+                    logger.error(f"[AudioAgent] Failed to load KWS model on CPU: {cpu_err}. Disabling KWS.")
+                    self.session = None
+                    self.kws_enabled = False
 
         if hasattr(self.bus, 'subscribe'):
             self.bus.subscribe("MoveServoCommand", self._handle_servo_move)
@@ -243,10 +268,12 @@ class AudioSensingAgent:
                 self._is_simulated_stereo = (stream_channels == 1 and self.channels == 2)
                 dev_default_sr = int(dev_info.get('default_samplerate', self.sample_rate))
 
-                # Try requested rate first, then device's native rate, then common rates
-                rates_to_try = [self.sample_rate]
-                if dev_default_sr not in rates_to_try:
+                # Prioritize hardware native rate first to prevent PortAudio C library paInvalidSampleRate errors
+                rates_to_try = []
+                if dev_default_sr and dev_default_sr > 0:
                     rates_to_try.append(dev_default_sr)
+                if self.sample_rate not in rates_to_try:
+                    rates_to_try.append(self.sample_rate)
                 for common_sr in (48000, 44100):
                     if common_sr not in rates_to_try:
                         rates_to_try.append(common_sr)
@@ -278,6 +305,9 @@ class AudioSensingAgent:
         self.stream = None
 
     def _prepare_tensor(self, features):
+        if self.input_info is None:
+            return np.ascontiguousarray(features.astype(np.float32).reshape(1, -1))
+
         onnx_type = self.input_info.type
         if onnx_type == "tensor(float)":
             data = features.astype(np.float32)
@@ -366,6 +396,10 @@ class AudioSensingAgent:
                     azimuth_deg=angle_deg
                 ))
 
+            # If KWS model is disabled or session is uninitialized, skip neural network inference
+            if not getattr(self, "kws_enabled", False) or self.session is None:
+                continue
+
             # Since stream is already 16 kHz, no downsampling is needed
             audio_16k = ch0[:WINDOW_SAMPLES]
 
@@ -428,12 +462,17 @@ class AudioSensingAgent:
                 logger.warning(f"[AudioAgent] Error stopping audio stream: {e}")
 
     async def start(self):
+        if not getattr(self, "enabled", True):
+            logger.info("[AudioAgent] Audio subsystem disabled (audio.enabled: false in config.yaml). Skipping audio capture.")
+            return
         self._start_hardware_stream(self.device_idx)
         self._worker_thread = threading.Thread(target=self._processing_worker, daemon=True, name="AudioDSPWorker")
         self._worker_thread.start()
         logger.info("[AudioAgent] Started.")
 
     async def stop(self):
+        if not getattr(self, "enabled", True):
+            return
         self.release()
         if hasattr(self, '_worker_thread') and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=1.0)
