@@ -166,20 +166,19 @@ class AudioSensingAgent:
         self._recent_hits = deque(maxlen=self.consecutive_hits)
         self._last_detection_time = 0.0
 
-        model_path = kws_cfg.get("model_path", "models/kws_model.onnx")
+        self.model_path = kws_cfg.get("model_path", "models/kws_model.onnx")
         available_eps = ort.get_available_providers()
         qnn_options = {
             "backend_path": "/usr/lib/libQnnHtp.so",
-            "htp_performance_mode": "high_performance",
             "profiling_level": "off"
         }
         providers = [("QNNExecutionProvider", qnn_options), "CPUExecutionProvider"] if "QNNExecutionProvider" in available_eps else ["CPUExecutionProvider"]
         try:
-            self.session = ort.InferenceSession(model_path, providers=providers)
+            self.session = ort.InferenceSession(self.model_path, providers=providers)
             logger.info(f"[AudioAgent] KWS loaded on {self.session.get_providers()}")
         except Exception as e:
             logger.warning(f"[AudioAgent] QNN Provider failed, using CPU fallback: {e}")
-            self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+            self.session = ort.InferenceSession(self.model_path, providers=["CPUExecutionProvider"])
 
         self.input_info = self.session.get_inputs()[0]
         self.output_info = self.session.get_outputs()[0]
@@ -373,7 +372,18 @@ class AudioSensingAgent:
             try:
                 features = extract_edge_impulse_features(audio_16k)
                 input_tensor = self._prepare_tensor(features)
-                outputs = self.session.run([self.output_info.name], {self.input_info.name: input_tensor})
+                try:
+                    outputs = self.session.run([self.output_info.name], {self.input_info.name: input_tensor})
+                except Exception as run_err:
+                    logger.warning(f"[AudioAgent] KWS inference failed on QNN ({run_err}). Falling back to CPUExecutionProvider...")
+                    try:
+                        self.session = ort.InferenceSession(self.model_path, providers=["CPUExecutionProvider"])
+                        self.input_info = self.session.get_inputs()[0]
+                        self.output_info = self.session.get_outputs()[0]
+                        outputs = self.session.run([self.output_info.name], {self.input_info.name: input_tensor})
+                    except Exception as cpu_err:
+                        logger.error(f"[AudioAgent] CPU fallback inference failed: {cpu_err}")
+                        continue
                 out = np.squeeze(outputs[0])
 
                 if out.ndim == 1 and (np.all(out >= 0) and np.all(out <= 1) and abs(np.sum(out) - 1.0) < 0.05):

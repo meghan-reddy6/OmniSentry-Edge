@@ -199,27 +199,24 @@ class VisionVLMAgent:
         npu_cfg = self.config.get("vision", {}).get("npu", {})
         vision_tracking = self.config.get("vision", {}).get("tracking", {})
         REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-        ctx_model_path = str(REPO_ROOT / "models" / "yolov8_det_ctx.onnx")
         model_cfg_path = npu_cfg.get("model_path", "models/yolov8_det.onnx")
-        if os.path.exists(ctx_model_path):
-            model_path = ctx_model_path
-            logger.info(f"[VisionAgent] Using pre-compiled QNN context binary: {model_path}")
-        else:
-            model_path = str(REPO_ROOT / model_cfg_path) if not os.path.isabs(model_cfg_path) else model_cfg_path
+        self.base_model_path = str(REPO_ROOT / model_cfg_path) if not os.path.isabs(model_cfg_path) else model_cfg_path
 
-        self.model_path = model_path
+        ctx_model_path = str(REPO_ROOT / "models" / "yolov8_det_ctx.onnx")
+        if os.path.exists(ctx_model_path):
+            self.model_path = ctx_model_path
+            logger.info(f"[VisionAgent] Using pre-compiled QNN context binary: {self.model_path}")
+        else:
+            self.model_path = self.base_model_path
+            logger.info(f"[VisionAgent] Using base model: {self.model_path}")
+
         self.conf_threshold = float(vision_tracking.get("conf_threshold", 0.35))
         self.nms_threshold = float(vision_tracking.get("nms_iou_threshold", 0.45))
 
         available_eps = ort.get_available_providers()
-        perf_mode = npu_cfg.get("performance_mode", "high_performance")
-        if perf_mode == "burst":
-            logger.warning("[VisionAgent] 'burst' mode can trigger FastRPC latency failures on Linux. Using 'high_performance'.")
-            perf_mode = "high_performance"
-
+        # Omit htp_performance_mode to avoid FastRPC SetRpcPowerConfigs ioctl failure on Linux
         qnn_options = {
             "backend_path": npu_cfg.get("backend_path", "/usr/lib/libQnnHtp.so"),
-            "htp_performance_mode": perf_mode,
             "profiling_level": "off"
         }
         providers = [("QNNExecutionProvider", qnn_options), "CPUExecutionProvider"] if "QNNExecutionProvider" in available_eps else ["CPUExecutionProvider"]
@@ -230,8 +227,9 @@ class VisionVLMAgent:
             self._session = ort.InferenceSession(self.model_path, sess_options=session_options, providers=providers)
             logger.info(f"[VisionAgent] InferenceSession initialized with providers: {self._session.get_providers()}")
         except Exception as e:
-            logger.warning(f"[VisionAgent] Primary provider setup failed: {e}. Falling back to CPUExecutionProvider.")
-            self._session = ort.InferenceSession(self.model_path, sess_options=session_options, providers=["CPUExecutionProvider"])
+            logger.warning(f"[VisionAgent] Primary provider setup failed: {e}. Falling back to CPUExecutionProvider on base model.")
+            self.model_path = self.base_model_path
+            self._session = ort.InferenceSession(self.base_model_path, sess_options=session_options, providers=["CPUExecutionProvider"])
 
         self._input_name = self._session.get_inputs()[0].name
 
@@ -359,11 +357,29 @@ class VisionVLMAgent:
         except Exception as e:
             logger.error(f"[VisionAgent] NPU inference failed ({e}). Falling back to CPUExecutionProvider...")
             try:
+                # If QNN failed on context binary, try base model on QNN first
+                if self.model_path != self.base_model_path:
+                    try:
+                        self.model_path = self.base_model_path
+                        session_options = ort.SessionOptions()
+                        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                        qnn_options = {"backend_path": "/usr/lib/libQnnHtp.so"}
+                        self._session = ort.InferenceSession(self.base_model_path, sess_options=session_options, providers=[("QNNExecutionProvider", qnn_options)])
+                        self._input_name = self._session.get_inputs()[0].name
+                        raw_outputs = self._session.run(None, {self._input_name: blob})
+                        logger.info("[VisionAgent] Base model running on QNNExecutionProvider successfully!")
+                        boxes, confs, classes, labels = decode_detections(raw_outputs, w, h, conf_thresh=self.conf_threshold, nms_thresh=self.nms_threshold)
+                        return [(b, c, cid, lbl) for b, c, cid, lbl in zip(boxes, confs, classes, labels)]
+                    except Exception:
+                        pass
+
+                # Fall back to CPU using base model (never pass context binary with EPContext to CPU)
                 session_options = ort.SessionOptions()
                 session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                self._session = ort.InferenceSession(self.model_path, sess_options=session_options, providers=["CPUExecutionProvider"])
+                self.model_path = self.base_model_path
+                self._session = ort.InferenceSession(self.base_model_path, sess_options=session_options, providers=["CPUExecutionProvider"])
                 self._input_name = self._session.get_inputs()[0].name
-                logger.info("[VisionAgent] Switched to CPUExecutionProvider successfully.")
+                logger.info("[VisionAgent] Switched to CPUExecutionProvider on base model successfully.")
                 raw_outputs = self._session.run(None, {self._input_name: blob})
             except Exception as cpu_err:
                 logger.error(f"[VisionAgent] Fallback inference also failed: {cpu_err}")

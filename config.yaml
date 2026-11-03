@@ -18,7 +18,6 @@ vision:
   npu:
     model_path: "models/yolov8_det.onnx"
     backend_path: "/usr/lib/libQnnHtp.so"
-    performance_mode: "high_performance"
     profiling_level: "off"
     intra_op_threads: 2
     inter_op_threads: 1
